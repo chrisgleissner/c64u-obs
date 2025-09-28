@@ -11,7 +11,77 @@
 #include "c64u-network.h"
 #include "c64u-video.h"
 #include "c64u-audio.h"
+#include "c64u-timing.h"
 #include "plugin-support.h"
+
+// Function to detect OBS target frame rate
+static double c64u_detect_obs_fps(void)
+{
+    // Try to get OBS video info to detect target frame rate
+    struct obs_video_info ovi;
+    if (obs_get_video_info(&ovi)) {
+        double fps = (double)ovi.fps_num / (double)ovi.fps_den;
+        C64U_LOG_INFO("📺 Detected OBS frame rate: %.3f Hz (%u/%u)", fps, ovi.fps_num, ovi.fps_den);
+
+        // Round to nearest standard frame rate
+        if (fps >= 59.0 && fps <= 61.0) {
+            return 60.0;
+        } else if (fps >= 49.0 && fps <= 51.0) {
+            return 50.0;
+        } else if (fps >= 29.0 && fps <= 31.0) {
+            return 30.0;
+        } else if (fps >= 24.0 && fps <= 26.0) {
+            return 25.0;
+        }
+
+        // Return detected rate if not a standard one
+        C64U_LOG_WARNING("⚠️  Non-standard OBS frame rate detected: %.3f Hz", fps);
+        return fps;
+    }
+
+    C64U_LOG_WARNING("⚠️  Could not detect OBS frame rate, defaulting to 50Hz");
+    return 50.0; // Default fallback
+}
+
+// Function to initialize timing system based on detected formats
+static void c64u_init_timing_system(struct c64u_source *context)
+{
+    if (context->timing_initialized || !context->format_detected) {
+        return;
+    }
+
+    // Get timing strategy from settings
+    obs_data_t *settings = obs_source_get_settings(context->source);
+    int strategy_int = (int)obs_data_get_int(settings, "timing_strategy");
+    c64u_timing_strategy_t strategy = (c64u_timing_strategy_t)strategy_int;
+    obs_data_release(settings);
+
+    // Detect OBS target frame rate
+    double obs_fps = c64u_detect_obs_fps();
+    context->obs_target_fps_x1000 = (uint64_t)(obs_fps * 1000.0);
+
+    // Use detected C64 frame rate
+    double c64_fps = context->expected_fps;
+
+    // Allocate and initialize timing system
+    context->timing = bzalloc(sizeof(struct c64u_timing_state));
+    if (context->timing) {
+        uint32_t frame_size = context->width * context->height * 4; // RGBA
+        c64u_timing_init(context->timing, strategy, obs_fps, c64_fps, frame_size);
+        context->timing_initialized = true;
+
+        C64U_LOG_INFO("🎯 Frame timing system initialized: C64 %.3f Hz -> OBS %.1f Hz", c64_fps, obs_fps);
+
+        // Log potential timing issues
+        double rate_diff = fabs(c64_fps - obs_fps) / obs_fps;
+        if (rate_diff > 0.01) { // More than 1% difference
+            C64U_LOG_WARNING("⚠️  Significant frame rate mismatch detected (%.1f%% difference)", rate_diff * 100.0);
+            C64U_LOG_INFO("   This may cause frame drops/duplicates without proper timing strategy");
+        }
+    } else {
+        C64U_LOG_ERROR("❌ Failed to allocate memory for timing system");
+    }
+}
 
 void *c64u_create(obs_data_t *settings, obs_source_t *source)
 {
@@ -101,6 +171,11 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
     context->format_detected = false;
     context->expected_fps = 50.125; // Default to PAL timing until detected
 
+    // Initialize timing system
+    context->timing = NULL;
+    context->timing_initialized = false;
+    context->obs_target_fps_x1000 = 50000; // Default to 50.000 Hz, will be detected
+
     // Initialize mutexes
     if (pthread_mutex_init(&context->frame_mutex, NULL) != 0) {
         C64U_LOG_ERROR("Failed to initialize frame mutex");
@@ -178,6 +253,13 @@ void c64u_destroy(void *data)
     }
 
     // Cleanup resources
+    // Clean up timing system
+    if (context->timing) {
+        c64u_timing_destroy(context->timing);
+        bfree(context->timing);
+        context->timing = NULL;
+    }
+
     pthread_mutex_destroy(&context->frame_mutex);
     pthread_mutex_destroy(&context->assembly_mutex);
     if (context->frame_buffer_front) {
@@ -416,39 +498,67 @@ void c64u_render(void *data, gs_effect_t *effect)
 
     // Note: Auto-start streaming now happens in c64u_create, not on first render
 
-    // Check if we have streaming data and frame ready
-    if (context->streaming && context->frame_ready && context->frame_buffer_front) {
-        // Render actual C64U video frame from front buffer
+    // Initialize timing system if format is detected but timing not yet initialized
+    if (context->format_detected && !context->timing_initialized) {
+        c64u_init_timing_system(context);
+    }
 
-        // Lock the frame buffer to ensure thread safety
-        if (pthread_mutex_lock(&context->frame_mutex) == 0) {
-            // Create texture from front buffer data
-            gs_texture_t *texture = gs_texture_create(context->width, context->height, GS_RGBA, 1,
-                                                      (const uint8_t **)&context->frame_buffer_front, 0);
-            if (texture) {
-                // Use default effect for texture rendering
-                gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-                if (default_effect) {
-                    gs_eparam_t *image_param = gs_effect_get_param_by_name(default_effect, "image");
-                    if (image_param) {
-                        gs_effect_set_texture(image_param, texture);
+    // Check if we have streaming data and should deliver frame
+    if (context->streaming && context->frame_ready) {
+        uint32_t *frame_to_render = NULL;
 
-                        gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
-                        if (tech) {
-                            gs_technique_begin(tech);
-                            gs_technique_begin_pass(tech, 0);
-                            gs_draw_sprite(texture, 0, context->width, context->height);
-                            gs_technique_end_pass(tech);
-                            gs_technique_end(tech);
-                        }
-                    }
+        // Use timing system to determine which frame to render
+        if (context->timing && context->timing_initialized && context->timing->strategy != C64U_TIMING_PASSTHROUGH) {
+            // Check if we should deliver a frame now
+            if (c64u_timing_should_deliver_frame(context->timing, render_start)) {
+                frame_to_render = c64u_timing_get_frame_for_obs(context->timing, context, render_start);
+
+                if (frame_to_render) {
+                    c64u_timing_on_obs_frame_delivered(context->timing, render_start);
                 }
-
-                // Clean up texture
-                gs_texture_destroy(texture);
             }
 
-            pthread_mutex_unlock(&context->frame_mutex);
+            // Safety fallback: if timing system doesn't provide a frame, use direct rendering
+            if (!frame_to_render) {
+                frame_to_render = context->frame_buffer_front;
+            }
+        } else {
+            // Direct rendering (original behavior) - always works
+            frame_to_render = context->frame_buffer_front;
+        }
+
+        // Render frame if we have one to render
+        if (frame_to_render) {
+            // Lock the frame buffer to ensure thread safety
+            if (pthread_mutex_lock(&context->frame_mutex) == 0) {
+                // Create texture from frame data
+                gs_texture_t *texture = gs_texture_create(context->width, context->height, GS_RGBA, 1,
+                                                          (const uint8_t **)&frame_to_render, 0);
+                if (texture) {
+                    // Use default effect for texture rendering
+                    gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+                    if (default_effect) {
+                        gs_eparam_t *image_param = gs_effect_get_param_by_name(default_effect, "image");
+                        if (image_param) {
+                            gs_effect_set_texture(image_param, texture);
+
+                            gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
+                            if (tech) {
+                                gs_technique_begin(tech);
+                                gs_technique_begin_pass(tech, 0);
+                                gs_draw_sprite(texture, 0, context->width, context->height);
+                                gs_technique_end_pass(tech);
+                                gs_technique_end(tech);
+                            }
+                        }
+                    }
+
+                    // Clean up texture
+                    gs_texture_destroy(texture);
+                }
+
+                pthread_mutex_unlock(&context->frame_mutex);
+            }
         }
     } else {
         // Show colored background to indicate plugin state
@@ -563,6 +673,20 @@ obs_properties_t *c64u_properties(void *data)
     obs_property_t *audio_port_prop = obs_properties_add_int(props, "audio_port", "Audio Port", 1024, 65535, 1);
     obs_property_set_long_description(audio_port_prop, "UDP port for audio stream (default: 11001)");
 
+    // Frame Timing Strategy
+    obs_property_t *timing_prop = obs_properties_add_list(props, "timing_strategy", "Frame Timing Strategy",
+                                                          OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(timing_prop, "Pass-through (original behavior)", 0);
+    obs_property_list_add_int(timing_prop, "Adaptive (recommended)", 1);
+    obs_property_list_add_int(timing_prop, "Interpolation (experimental)", 2);
+    obs_property_list_add_int(timing_prop, "VSync aware", 3);
+    obs_property_set_long_description(timing_prop,
+                                      "Frame timing strategy to handle C64 50.125Hz vs OBS 50Hz mismatch:\n"
+                                      "• Pass-through: Direct frames (may cause stuttering)\n"
+                                      "• Adaptive: Smart frame dropping/duplication (recommended)\n"
+                                      "• Interpolation: Frame blending (experimental)\n"
+                                      "• VSync aware: Align with OBS rendering");
+
     return props;
 }
 
@@ -576,4 +700,5 @@ void c64u_defaults(obs_data_t *settings)
     obs_data_set_default_string(settings, "obs_ip_address", ""); // Empty by default, will be auto-detected
     obs_data_set_default_int(settings, "video_port", C64U_DEFAULT_VIDEO_PORT);
     obs_data_set_default_int(settings, "audio_port", C64U_DEFAULT_AUDIO_PORT);
+    obs_data_set_default_int(settings, "timing_strategy", 0); // Default to passthrough (original behavior)
 }

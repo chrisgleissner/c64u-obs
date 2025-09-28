@@ -7,6 +7,7 @@
 #include "c64u-types.h"
 #include "c64u-protocol.h"
 #include "c64u-network.h"
+#include "c64u-timing.h"
 
 // VIC color palette (BGRA values for OBS) - converted from grab.py RGB values
 const uint32_t vic_colors[16] = {
@@ -323,6 +324,12 @@ void *video_thread_func(void *data)
                             assemble_frame_to_buffer(context, &context->current_frame);
                             swap_frame_buffers(context);
                             context->last_completed_frame = context->current_frame.frame_num;
+
+                            // Notify timing system of new C64 frame
+                            if (context->timing && context->timing_initialized) {
+                                c64u_timing_on_c64_frame_received(context->timing, os_gettime_ns());
+                            }
+
                             // Track diagnostics (only once per completed frame!)
                             context->frames_completed++;
                             context->buffer_swaps++;

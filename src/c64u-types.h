@@ -8,6 +8,9 @@
 #include <stdbool.h>
 #include "c64u-network.h"
 
+// Forward declaration for timing system
+struct c64u_timing_state;
+
 // Frame packet structure for reordering
 struct frame_packet {
     uint16_t line_num;
@@ -87,9 +90,14 @@ struct c64u_source {
     pthread_mutex_t frame_mutex;
     pthread_mutex_t assembly_mutex;
 
-    // Frame timing
+    // Frame timing system
+    struct c64u_timing_state *timing;
+    uint64_t obs_target_fps_x1000; // OBS target FPS * 1000 for precision (50000 or 60000)
+    bool timing_initialized;
+
+    // Legacy frame timing (deprecated, kept for compatibility)
     uint64_t last_frame_time;
-    uint64_t frame_interval_ns; // Target frame interval (20ms for 50Hz PAL)
+    uint64_t frame_interval_ns;
 
     // Auto-start control
     bool auto_start_attempted;
