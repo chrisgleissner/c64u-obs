@@ -36,6 +36,7 @@ bool obs_module_load(void)
     // DEBUG: This will always be hit when the plugin loads
     // Module loading
 
+    C64U_LOG_INFO("🔧 Setting up source info structure...");
     struct obs_source_info c64u_info = {.id = "c64u_source",
                                         .type = OBS_SOURCE_TYPE_INPUT,
                                         .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO,
@@ -49,6 +50,8 @@ bool obs_module_load(void)
                                         .get_width = c64u_get_width,
                                         .get_height = c64u_get_height};
 
+    C64U_LOG_INFO("📝 Registering source with OBS (id: %s, render: %p)...", c64u_info.id,
+                  (void *)c64u_info.video_render);
     obs_register_source(&c64u_info);
     C64U_LOG_INFO("C64U plugin loaded successfully");
     return true;

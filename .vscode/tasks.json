@@ -29,10 +29,10 @@
         {
             "label": "Install Plugin to OBS",
             "type": "shell",
-            "command": "cp",
+            "command": "bash",
             "args": [
-                "build_x86_64/c64u-plugin-for-obs.so",
-                "${env:HOME}/.config/obs-studio/plugins/c64u-plugin-for-obs/bin/64bit/"
+                "-c",
+                "mkdir -p ${env:HOME}/.config/obs-studio/plugins/c64u-plugin-for-obs/bin/64bit && cp build_x86_64/c64u-plugin-for-obs.so ${env:HOME}/.config/obs-studio/plugins/c64u-plugin-for-obs/bin/64bit/ && rsync -a build_x86_64/rundir/RelWithDebInfo/c64u-plugin-for-obs/ ${env:HOME}/.config/obs-studio/plugins/c64u-plugin-for-obs/data/"
             ],
             "group": "build",
             "presentation": {

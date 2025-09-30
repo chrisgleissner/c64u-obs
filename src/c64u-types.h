@@ -31,7 +31,7 @@ struct c64u_source {
 
     // Configuration
     char ip_address[64];     // C64 IP Address (C64 Ultimate device)
-    char obs_ip_address[64]; // OBS IP Address (this machine)
+    char obs_ip_address[64]; // OBS IP Address (this server)
     bool auto_detect_ip;
     bool initial_ip_detected; // Flag to track if initial IP detection was done
     uint32_t video_port;
@@ -98,7 +98,11 @@ struct c64u_source {
     uint32_t delay_queue_head;      // Head position in delay queue
     uint32_t delay_queue_tail;      // Tail position in delay queue
     uint16_t *delay_sequence_queue; // Sequence numbers for delayed frames
-    pthread_mutex_t delay_mutex;    // Mutex for delay queue access
+
+    // Logo display
+    gs_texture_t *logo_texture;  // C64U logo texture for no-signal display
+    bool logo_load_attempted;    // Flag to track if logo loading was attempted
+    pthread_mutex_t delay_mutex; // Mutex for delay queue access
 
     // Auto-start control
     bool auto_start_attempted;

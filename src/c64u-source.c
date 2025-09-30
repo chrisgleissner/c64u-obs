@@ -14,9 +14,38 @@
 #include "c64u-record.h"
 #include "plugin-support.h"
 
+// Load the C64U logo texture from module data directory
+static gs_texture_t *load_logo_texture(void)
+{
+    C64U_LOG_INFO("Attempting to load logo texture...");
+
+    // Use obs_module_file() to get the path to the logo in the data directory
+    char *logo_path = obs_module_file("images/c64u-logo.png");
+    if (!logo_path) {
+        C64U_LOG_WARNING("Failed to locate logo file in module data directory");
+        return NULL;
+    }
+
+    C64U_LOG_INFO("Logo path resolved to: %s", logo_path);
+
+    // Load texture directly from the data directory
+    gs_texture_t *logo_texture = gs_texture_create_from_file(logo_path);
+
+    if (!logo_texture) {
+        C64U_LOG_WARNING("Failed to load logo texture from: %s", logo_path);
+    } else {
+        uint32_t width = gs_texture_get_width(logo_texture);
+        uint32_t height = gs_texture_get_height(logo_texture);
+        C64U_LOG_INFO("Loaded logo texture from: %s (size: %ux%u)", logo_path, width, height);
+    }
+
+    bfree(logo_path);
+    return logo_texture;
+}
+
 void *c64u_create(obs_data_t *settings, obs_source_t *source)
 {
-    C64U_LOG_INFO("Creating C64U source");
+    C64U_LOG_INFO("🚀 Creating C64U source - settings: %p, source: %p", (void *)settings, (void *)source);
 
     // C64U source creation
 
@@ -160,6 +189,10 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
     // Apply recording settings from OBS
     c64u_record_update_settings(context, settings);
 
+    // Logo will be loaded lazily on first render (when graphics context is available)
+    context->logo_texture = NULL;
+    context->logo_load_attempted = false;
+
     C64U_LOG_INFO("C64U source created - C64 IP: %s, OBS IP: %s, Video: %u, Audio: %u", context->ip_address,
                   context->obs_ip_address, context->video_port, context->audio_port);
 
@@ -168,6 +201,8 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
     c64u_start_streaming(context);
     context->auto_start_attempted = true;
 
+    C64U_LOG_INFO("✅ c64u_create returning context: %p (logo_load_attempted: %d, logo_texture: %p)", (void *)context,
+                  context->logo_load_attempted, (void *)context->logo_texture);
     return context;
 }
 
@@ -212,6 +247,12 @@ void c64u_destroy(void *data)
 
     // Cleanup recording module
     c64u_record_cleanup(context);
+
+    // Cleanup logo texture
+    if (context->logo_texture) {
+        gs_texture_destroy(context->logo_texture);
+        context->logo_texture = NULL;
+    }
 
     // Cleanup resources
     pthread_mutex_destroy(&context->frame_mutex);
@@ -486,6 +527,29 @@ void c64u_render(void *data, gs_effect_t *effect)
     struct c64u_source *context = data;
     UNUSED_PARAMETER(effect);
 
+    static bool first_render = true;
+    if (first_render) {
+        C64U_LOG_INFO("🎨 First render called - context: %p", (void *)context);
+        first_render = false;
+    }
+
+    if (!context) {
+        C64U_LOG_ERROR("Render called with NULL context!");
+        return;
+    }
+
+    // Lazy load logo texture on first render (when graphics context is available)
+    if (!context->logo_load_attempted) {
+        C64U_LOG_INFO("Logo load not yet attempted, loading now...");
+        context->logo_texture = load_logo_texture();
+        context->logo_load_attempted = true;
+        if (context->logo_texture) {
+            C64U_LOG_INFO("Logo texture loaded successfully");
+        } else {
+            C64U_LOG_WARNING("Logo texture is NULL after loading attempt");
+        }
+    }
+
     // Track render timing for diagnostic purposes
     static uint64_t last_render_time = 0;
     static uint32_t render_calls = 0;
@@ -496,7 +560,29 @@ void c64u_render(void *data, gs_effect_t *effect)
     // Note: Auto-start streaming now happens in c64u_create, not on first render
 
     // Check if we have streaming data and frame ready
-    if (context->streaming && context->frame_ready && context->frame_buffer_front) {
+    static bool was_rendering_video = false;
+    static uint64_t last_state_log = 0;
+    bool should_render_video = (context->streaming && context->frame_ready && context->frame_buffer_front);
+
+    // Log state changes
+    if (should_render_video != was_rendering_video) {
+        C64U_LOG_INFO("🎬 Render mode switch: %s (streaming:%d, frame_ready:%d)",
+                      should_render_video ? "VIDEO" : "LOGO", context->streaming, context->frame_ready);
+        was_rendering_video = should_render_video;
+        last_state_log = os_gettime_ns();
+    }
+
+    // Periodically log state when in LOGO mode to help debug why logo might not show
+    if (!should_render_video) {
+        uint64_t now = os_gettime_ns();
+        if (last_state_log == 0 || (now - last_state_log) >= 5000000000ULL) { // Every 5 seconds
+            C64U_LOG_INFO("📺 Rendering LOGO mode (streaming:%d, frame_ready:%d, logo_texture:%p)", context->streaming,
+                          context->frame_ready, (void *)context->logo_texture);
+            last_state_log = now;
+        }
+    }
+
+    if (should_render_video) {
         // Render actual C64U video frame from front buffer
 
         // Lock the frame buffer to ensure thread safety
@@ -546,30 +632,135 @@ void c64u_render(void *data, gs_effect_t *effect)
             }
         }
 
-        // Show colored background to indicate plugin state
-        gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-        gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
+        // Show C64U logo centered on black background
+        if (context->logo_texture) {
+            static bool logged_logo_render = false;
+            if (!logged_logo_render) {
+                C64U_LOG_INFO("📺 Rendering logo (texture: %p, streaming: %d, frame_ready: %d)",
+                              (void *)context->logo_texture, context->streaming, context->frame_ready);
+                logged_logo_render = true;
+            }
 
-        if (solid && color) {
-            gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
-            if (tech) {
-                gs_technique_begin(tech);
-                gs_technique_begin_pass(tech, 0);
+            // First draw black background
+            gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+            gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
 
-                if (context->streaming) {
-                    // Show yellow if streaming but no frame ready yet
-                    struct vec4 yellow = {0.8f, 0.8f, 0.2f, 1.0f};
-                    gs_effect_set_vec4(color, &yellow);
-                } else {
-                    // Show dark blue to indicate plugin loaded but no streaming
-                    struct vec4 dark_blue = {0.1f, 0.2f, 0.4f, 1.0f};
-                    gs_effect_set_vec4(color, &dark_blue);
+            if (solid && color) {
+                gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
+                if (tech) {
+                    gs_technique_begin(tech);
+                    gs_technique_begin_pass(tech, 0);
+
+                    // Black background
+                    struct vec4 black = {0.0f, 0.0f, 0.0f, 1.0f};
+                    gs_effect_set_vec4(color, &black);
+                    gs_draw_sprite(NULL, 0, context->width, context->height);
+
+                    gs_technique_end_pass(tech);
+                    gs_technique_end(tech);
                 }
+            }
 
-                gs_draw_sprite(NULL, 0, context->width, context->height);
+            // Then draw centered logo
+            gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+            static bool logged_effect = false;
+            if (!logged_effect) {
+                C64U_LOG_INFO("🖼️ Logo render: default_effect=%p", (void *)default_effect);
+                logged_effect = true;
+            }
+            if (default_effect) {
+                gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
+                static bool logged_tech = false;
+                if (!logged_tech) {
+                    C64U_LOG_INFO("🖼️ Logo render: technique=%p", (void *)tech);
+                    logged_tech = true;
+                }
+                if (tech) {
+                    uint32_t logo_width = gs_texture_get_width(context->logo_texture);
+                    uint32_t logo_height = gs_texture_get_height(context->logo_texture);
 
-                gs_technique_end_pass(tech);
-                gs_technique_end(tech);
+                    // Calculate scale to fit logo within canvas while maintaining aspect ratio
+                    float scale_x = (float)context->width / (float)logo_width;
+                    float scale_y = (float)context->height / (float)logo_height;
+                    float scale = (scale_x < scale_y) ? scale_x : scale_y;
+
+                    // Limit scale to max 1.0 (don't enlarge small logos)
+                    if (scale > 1.0f) {
+                        scale = 1.0f;
+                    }
+
+                    // Calculate scaled dimensions
+                    float scaled_width = logo_width * scale;
+                    float scaled_height = logo_height * scale;
+
+                    // Center the scaled logo
+                    float x = (context->width - scaled_width) / 2.0f;
+                    float y = (context->height - scaled_height) / 2.0f;
+
+                    static bool logged_draw = false;
+                    if (!logged_draw) {
+                        C64U_LOG_INFO("🖼️ Drawing logo: %ux%u scaled to %.0fx%.0f at (%.1f,%.1f) on canvas %ux%u",
+                                      logo_width, logo_height, scaled_width, scaled_height, x, y, context->width,
+                                      context->height);
+                        logged_draw = true;
+                    }
+
+                    gs_matrix_push();
+                    gs_matrix_translate3f(x, y, 0.0f);
+                    gs_matrix_scale3f(scale, scale, 1.0f);
+
+                    gs_technique_begin(tech);
+                    gs_technique_begin_pass(tech, 0);
+
+                    gs_eparam_t *image = gs_effect_get_param_by_name(default_effect, "image");
+                    gs_effect_set_texture(image, context->logo_texture);
+
+                    gs_draw_sprite(context->logo_texture, 0, logo_width, logo_height);
+
+                    gs_technique_end_pass(tech);
+                    gs_technique_end(tech);
+
+                    gs_matrix_pop();
+                } else {
+                    static bool logged_no_tech = false;
+                    if (!logged_no_tech) {
+                        C64U_LOG_WARNING("❌ Failed to get 'Draw' technique from default effect!");
+                        logged_no_tech = true;
+                    }
+                }
+            } else {
+                static bool logged_no_effect = false;
+                if (!logged_no_effect) {
+                    C64U_LOG_WARNING("❌ Failed to get OBS_EFFECT_DEFAULT!");
+                    logged_no_effect = true;
+                }
+            }
+        } else {
+            // Fallback to colored background if logo failed to load
+            gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+            gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
+
+            if (solid && color) {
+                gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
+                if (tech) {
+                    gs_technique_begin(tech);
+                    gs_technique_begin_pass(tech, 0);
+
+                    if (context->streaming) {
+                        // Show yellow if streaming but no frame ready yet
+                        struct vec4 yellow = {0.8f, 0.8f, 0.2f, 1.0f};
+                        gs_effect_set_vec4(color, &yellow);
+                    } else {
+                        // Show dark blue to indicate plugin loaded but no streaming
+                        struct vec4 dark_blue = {0.1f, 0.2f, 0.4f, 1.0f};
+                        gs_effect_set_vec4(color, &dark_blue);
+                    }
+
+                    gs_draw_sprite(NULL, 0, context->width, context->height);
+
+                    gs_technique_end_pass(tech);
+                    gs_technique_end(tech);
+                }
             }
         }
     }
@@ -639,19 +830,29 @@ void c64u_render(void *data, gs_effect_t *effect)
 uint32_t c64u_get_width(void *data)
 {
     struct c64u_source *context = data;
+    static bool first_call = true;
+    if (first_call) {
+        C64U_LOG_INFO("📏 get_width called: %u", context->width);
+        first_call = false;
+    }
     return context->width;
 }
 
 uint32_t c64u_get_height(void *data)
 {
     struct c64u_source *context = data;
+    static bool first_call = true;
+    if (first_call) {
+        C64U_LOG_INFO("📏 get_height called: %u", context->height);
+        first_call = false;
+    }
     return context->height;
 }
 
 const char *c64u_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "C64U Display";
+    return obs_module_text("C64U");
 }
 
 obs_properties_t *c64u_properties(void *data)

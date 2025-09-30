@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 
-# Default values 
+# Default values
 PLATFORM="ubuntu"
 INSTALL_PLUGIN=false
 START_OBS=false
@@ -32,7 +32,7 @@ log_success() {
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1" 
+    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
 log_error() {
@@ -45,7 +45,7 @@ Usage: $0 [PLATFORM] [OPTIONS]
 
 PLATFORMS:
     ubuntu      Build for Ubuntu/Linux (default)
-    macos       Build for macOS  
+    macos       Build for macOS
     windows     Build for Windows
 
 OPTIONS:
@@ -118,7 +118,7 @@ setup_docker_image() {
             exit 1
             ;;
         windows)
-            log_error "Windows builds require Windows host system - Docker cross-compilation not supported" 
+            log_error "Windows builds require Windows host system - Docker cross-compilation not supported"
             log_info "Use native Windows build instead:"
             log_info "  cmake --preset windows-x64 && cmake --build build_x64 --config $BUILD_CONFIG"
             exit 1
@@ -230,14 +230,14 @@ start_obs() {
     fi
 
     log_info "Starting OBS Studio..."
-    log_info "Look for 'C64U Display' in the source list"
-    
+    log_info "Look for 'C64U' in the source list"
+
     # Start OBS in background and detach
     nohup obs > /dev/null 2>&1 &
     OBS_PID=$!
-    
+
     log_success "OBS Studio started (PID: $OBS_PID)"
-    log_info "Plugin should be available as 'C64U Display' source"
+    log_info "Plugin should be available as 'C64U' source"
 }
 
 # Parse command line arguments

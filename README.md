@@ -9,7 +9,7 @@ This plugin implements a native OBS source that receives video and audio streams
 
 The plugin connects directly to the Ultimate's network interface, eliminating the need for capture cards or composite video connections.
 
-![C64U Main Screen](./doc/img/ObsMainScreen.png "C64U Main Screen")
+![OBS Window](./doc/img/obs-window.png "OBS Window")
 
 
 **Features:**
@@ -64,7 +64,7 @@ See the [OBS Plugins Guide](https://obsproject.com/kb/plugins-guide).
 
 ### Configuration ⚙️
 
-![C64U Configuration](./doc/img/ObsPluginProperties.png "C64U Configuration")
+![Properties Window](./doc/img/properties-window.png "Properties Window")
 
 **Getting Your C64 on Stream:**
 
