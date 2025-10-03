@@ -5,6 +5,111 @@
 #include <string.h>
 #include <inttypes.h>
 #include <pthread.h>
+#ifdef __cplusplus
+#include <string>
+#include <memory>
+#include <algorithm>
+
+// RAII wrapper for OBS memory allocation
+class ObsMemory {
+    public:
+    explicit ObsMemory(size_t size) : ptr_(bmalloc(size)), size_(size)
+    {
+        if (ptr_) {
+            memset(ptr_, 0, size_);
+        }
+    }
+
+    ~ObsMemory()
+    {
+        if (ptr_) {
+            bfree(ptr_);
+        }
+    }
+
+    // Non-copyable
+    ObsMemory(const ObsMemory &) = delete;
+    ObsMemory &operator=(const ObsMemory &) = delete;
+
+    // Movable
+    ObsMemory(ObsMemory &&other) noexcept : ptr_(other.ptr_), size_(other.size_)
+    {
+        other.ptr_ = nullptr;
+        other.size_ = 0;
+    }
+
+    ObsMemory &operator=(ObsMemory &&other) noexcept
+    {
+        if (this != &other) {
+            if (ptr_) {
+                bfree(ptr_);
+            }
+            ptr_ = other.ptr_;
+            size_ = other.size_;
+            other.ptr_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+
+    void *get() const { return ptr_; }
+    template<typename T> T *get_as() const { return static_cast<T *>(ptr_); }
+    bool is_valid() const { return ptr_ != nullptr; }
+    size_t size() const { return size_; }
+
+    private:
+    void *ptr_;
+    size_t size_;
+};
+
+// C++ helper functions for string operations
+#ifdef __cplusplus
+namespace {
+// Safe string copying with automatic size management
+std::string safe_get_string(obs_data_t *settings, const char *name, const char *default_val = "")
+{
+    const char *str = obs_data_get_string(settings, name);
+    return str ? std::string(str) : std::string(default_val);
+}
+
+// Safe IP address validation
+bool is_valid_ip_format(const std::string &ip)
+{
+    if (ip.empty() || ip.length() > 15)
+        return false;
+
+    int dots = std::count(ip.begin(), ip.end(), '.');
+    if (dots != 3)
+        return false;
+
+    size_t start = 0;
+    for (int i = 0; i < 4; i++) {
+        size_t dot_pos = (i == 3) ? ip.length() : ip.find('.', start);
+        if (dot_pos == std::string::npos)
+            return false;
+
+        std::string part = ip.substr(start, dot_pos - start);
+        if (part.empty() || part.length() > 3)
+            return false;
+
+        for (char c : part) {
+            if (c < '0' || c > '9')
+                return false;
+        }
+
+        int num = std::stoi(part);
+        if (num < 0 || num > 255)
+            return false;
+
+        start = dot_pos + 1;
+    }
+    return true;
+}
+} // namespace
+#endif
+
+extern "C" {
+#endif
 #include "c64u-logging.h"
 #include "c64u-source.h"
 #include "c64u-types.h"
@@ -73,7 +178,7 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
         networking_initialized = true;
     }
 
-    struct c64u_source *context = bzalloc(sizeof(struct c64u_source));
+    struct c64u_source *context = (struct c64u_source *)bzalloc(sizeof(struct c64u_source));
     if (!context) {
         C64U_LOG_ERROR("Failed to allocate memory for source context");
         return NULL;
@@ -82,8 +187,18 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
     context->source = source;
 
     // Initialize configuration from settings
+#ifdef __cplusplus
+    // Use C++ helpers for safer string handling
+    std::string ip_str = safe_get_string(settings, "ip_address", C64U_DEFAULT_IP);
+    if (!is_valid_ip_format(ip_str)) {
+        C64U_LOG_WARNING("Invalid IP format '%s', using default", ip_str.c_str());
+        ip_str = C64U_DEFAULT_IP;
+    }
+    strncpy(context->ip_address, ip_str.c_str(), sizeof(context->ip_address) - 1);
+#else
     const char *ip = obs_data_get_string(settings, "ip_address");
     strncpy(context->ip_address, ip ? ip : C64U_DEFAULT_IP, sizeof(context->ip_address) - 1);
+#endif
     context->auto_detect_ip = obs_data_get_bool(settings, "auto_detect_ip");
     context->video_port = (uint32_t)obs_data_get_int(settings, "video_port");
     context->audio_port = (uint32_t)obs_data_get_int(settings, "audio_port");
@@ -91,6 +206,15 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
 
     // Initialize OBS IP address from settings or auto-detect on first run
     memset(context->obs_ip_address, 0, sizeof(context->obs_ip_address));
+#ifdef __cplusplus
+    std::string saved_obs_ip = safe_get_string(settings, "obs_ip_address");
+
+    if (!saved_obs_ip.empty() && is_valid_ip_format(saved_obs_ip)) {
+        // Use previously saved/configured OBS IP address
+        strncpy(context->obs_ip_address, saved_obs_ip.c_str(), sizeof(context->obs_ip_address) - 1);
+        context->initial_ip_detected = true;
+        C64U_LOG_INFO("Using saved OBS IP address: %s", context->obs_ip_address);
+#else
     const char *saved_obs_ip = obs_data_get_string(settings, "obs_ip_address");
 
     if (saved_obs_ip && strlen(saved_obs_ip) > 0) {
@@ -98,6 +222,7 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
         strncpy(context->obs_ip_address, saved_obs_ip, sizeof(context->obs_ip_address) - 1);
         context->initial_ip_detected = true;
         C64U_LOG_INFO("Using saved OBS IP address: %s", context->obs_ip_address);
+#endif
     } else {
         // First time - detect local IP address
         if (c64u_detect_local_ip(context->obs_ip_address, sizeof(context->obs_ip_address))) {
@@ -130,8 +255,8 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
 
     // Allocate video buffers (double buffering)
     size_t frame_size = context->width * context->height * 4; // RGBA
-    context->frame_buffer_front = bmalloc(frame_size);
-    context->frame_buffer_back = bmalloc(frame_size);
+    context->frame_buffer_front = (uint32_t *)bmalloc(frame_size);
+    context->frame_buffer_back = (uint32_t *)bmalloc(frame_size);
     if (!context->frame_buffer_front || !context->frame_buffer_back) {
         C64U_LOG_ERROR("Failed to allocate video frame buffers");
         if (context->frame_buffer_front)
@@ -237,7 +362,7 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
 
 void c64u_destroy(void *data)
 {
-    struct c64u_source *context = data;
+    struct c64u_source *context = (struct c64u_source *)data;
     if (!context)
         return;
 
@@ -300,7 +425,7 @@ void c64u_destroy(void *data)
 
 void c64u_update(void *data, obs_data_t *settings)
 {
-    struct c64u_source *context = data;
+    struct c64u_source *context = (struct c64u_source *)data;
     if (!context)
         return;
 
@@ -323,14 +448,30 @@ void c64u_update(void *data, obs_data_t *settings)
     }
 
     // Update configuration
+#ifdef __cplusplus
+    // Use C++ helpers for safer string handling
+    std::string new_ip = safe_get_string(settings, "ip_address", C64U_DEFAULT_IP);
+    std::string new_obs_ip = safe_get_string(settings, "obs_ip_address");
+
+    // Validate IP addresses
+    if (!is_valid_ip_format(new_ip)) {
+        C64U_LOG_WARNING("Invalid C64U IP format '%s', using previous value", new_ip.c_str());
+        new_ip = context->ip_address;
+    }
+    if (!new_obs_ip.empty() && !is_valid_ip_format(new_obs_ip)) {
+        C64U_LOG_WARNING("Invalid OBS IP format '%s', keeping previous value", new_obs_ip.c_str());
+        new_obs_ip = context->obs_ip_address;
+    }
+#else
     const char *new_ip = obs_data_get_string(settings, "ip_address");
     const char *new_obs_ip = obs_data_get_string(settings, "obs_ip_address");
-    uint32_t new_video_port = (uint32_t)obs_data_get_int(settings, "video_port");
-    uint32_t new_audio_port = (uint32_t)obs_data_get_int(settings, "audio_port");
 
     // Set defaults
     if (!new_ip)
         new_ip = C64U_DEFAULT_IP;
+#endif
+    uint32_t new_video_port = (uint32_t)obs_data_get_int(settings, "video_port");
+    uint32_t new_audio_port = (uint32_t)obs_data_get_int(settings, "audio_port");
     if (new_video_port == 0)
         new_video_port = C64U_DEFAULT_VIDEO_PORT;
     if (new_audio_port == 0)
@@ -351,12 +492,21 @@ void c64u_update(void *data, obs_data_t *settings)
     }
 
     // Update configuration
+#ifdef __cplusplus
+    strncpy(context->ip_address, new_ip.c_str(), sizeof(context->ip_address) - 1);
+    context->ip_address[sizeof(context->ip_address) - 1] = '\0';
+    if (!new_obs_ip.empty()) {
+        strncpy(context->obs_ip_address, new_obs_ip.c_str(), sizeof(context->obs_ip_address) - 1);
+        context->obs_ip_address[sizeof(context->obs_ip_address) - 1] = '\0';
+    }
+#else
     strncpy(context->ip_address, new_ip, sizeof(context->ip_address) - 1);
     context->ip_address[sizeof(context->ip_address) - 1] = '\0';
     if (new_obs_ip) {
         strncpy(context->obs_ip_address, new_obs_ip, sizeof(context->obs_ip_address) - 1);
         context->obs_ip_address[sizeof(context->obs_ip_address) - 1] = '\0';
     }
+#endif
     context->video_port = new_video_port;
     context->audio_port = new_audio_port;
 
@@ -524,7 +674,7 @@ void c64u_stop_streaming(struct c64u_source *context)
 
 void c64u_render(void *data, gs_effect_t *effect)
 {
-    struct c64u_source *context = data;
+    struct c64u_source *context = (struct c64u_source *)data;
     UNUSED_PARAMETER(effect);
 
     if (!context) {
@@ -730,13 +880,13 @@ void c64u_render(void *data, gs_effect_t *effect)
 
 uint32_t c64u_get_width(void *data)
 {
-    struct c64u_source *context = data;
+    struct c64u_source *context = (struct c64u_source *)data;
     return context->width;
 }
 
 uint32_t c64u_get_height(void *data)
 {
-    struct c64u_source *context = data;
+    struct c64u_source *context = (struct c64u_source *)data;
     return context->height;
 }
 
@@ -858,3 +1008,7 @@ void c64u_defaults(obs_data_t *settings)
     // Video recording defaults
     obs_data_set_default_bool(settings, "record_video", false); // Disabled by default
 }
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
