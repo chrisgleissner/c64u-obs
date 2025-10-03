@@ -1,5 +1,11 @@
 #include <obs-module.h>
 #include <string.h>
+#ifdef __cplusplus
+#include <memory>
+#include <string>
+#include <system_error>
+extern "C" {
+#endif
 #include "c64u-logging.h"
 #include "c64u-network.h"
 #include "plugin-support.h"
@@ -318,3 +324,39 @@ socket_t create_tcp_socket(const char *ip, uint32_t port)
     obs_log(LOG_DEBUG, "[C64U] Connected to C64U at %s:%u", ip, port);
     return sock;
 }
+
+#ifdef __cplusplus
+} // extern "C"
+
+// C++ utilities for improved error handling and resource management
+namespace c64u {
+
+// RAII socket wrapper
+class Socket {
+    public:
+    explicit Socket(socket_t sock = INVALID_SOCKET_VALUE) : sock_(sock) {}
+    ~Socket()
+    {
+        if (sock_ != INVALID_SOCKET_VALUE)
+            close(sock_);
+    }
+
+    Socket(const Socket &) = delete;
+    Socket &operator=(const Socket &) = delete;
+
+    Socket(Socket &&other) noexcept : sock_(other.sock_) { other.sock_ = INVALID_SOCKET_VALUE; }
+
+    socket_t get() const { return sock_; }
+    socket_t release()
+    {
+        socket_t temp = sock_;
+        sock_ = INVALID_SOCKET_VALUE;
+        return temp;
+    }
+
+    private:
+    socket_t sock_;
+};
+
+} // namespace c64u
+#endif

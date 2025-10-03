@@ -7,6 +7,14 @@
 #include <stdlib.h>
 #include <time.h>
 #include <sys/stat.h>
+#ifdef __cplusplus
+#include <memory>
+#include <string>
+#include <fstream>
+#include <vector>
+#include <filesystem>
+extern "C" {
+#endif
 #include "c64u-logging.h"
 #include "c64u-record.h"
 #include "c64u-types.h"
