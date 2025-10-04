@@ -1,0 +1,47 @@
+# GitHub Pages configuration for c64u-obs
+title: "C64 Ultimate OBS Plugin"
+description: "Stream your Commodore 64 Ultimate directly to OBS Studio over network connection"
+url: "https://chrisgleissner.github.io"
+baseurl: "/c64u-obs"
+
+# Repository information
+repository: "chrisgleissner/c64u-obs"
+github_username: "chrisgleissner"
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+
+# Plugins
+plugins:
+  - jekyll-feed
+  - jekyll-sitemap
+
+# Exclude from processing
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+
+# Include files
+include:
+  - _pages
+
+# Collections
+collections:
+  pages:
+    output: true
+    permalink: /:name/
+
+# Default values
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "default"

@@ -406,7 +406,7 @@ bool c64u_get_user_documents_path(char *path_buffer, size_t buffer_size)
 #endif
 }
 
-socket_t create_udp_socket(uint32_t port)
+socket_t c64u_create_udp_socket(uint32_t port)
 {
     socket_t sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == INVALID_SOCKET_VALUE) {
@@ -484,7 +484,99 @@ socket_t create_udp_socket(uint32_t port)
     return sock;
 }
 
-socket_t create_tcp_socket(const char *ip, uint32_t port)
+// Quick connectivity test with moderate timeout (for async retry tasks)
+bool c64u_test_connectivity(const char *ip, uint32_t port)
+{
+    if (!ip || strlen(ip) == 0) {
+        return false;
+    }
+
+    socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET_VALUE) {
+        return false;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+        close(sock);
+        return false;
+    }
+
+    // Set socket to non-blocking for timeout control
+#ifdef _WIN32
+    u_long non_blocking = 1;
+    if (ioctlsocket(sock, FIONBIO, &non_blocking) != 0) {
+        close(sock);
+        return false;
+    }
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(sock);
+        return false;
+    }
+#endif
+
+    // Attempt connection (will return immediately with EINPROGRESS/WSAEWOULDBLOCK)
+    int connect_result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (connect_result == 0) {
+        close(sock);
+        return true;
+    }
+
+    int error = c64u_get_socket_error();
+#ifdef _WIN32
+    if (error != WSAEWOULDBLOCK) {
+#else
+    if (error != EINPROGRESS) {
+#endif
+        close(sock);
+        return false;
+    }
+
+    // Universal moderate timeout for connectivity tests
+    // 250ms: Fast enough to prevent UI blocking, long enough for most real connections
+    fd_set write_fds;
+    FD_ZERO(&write_fds);
+    FD_SET(sock, &write_fds);
+
+    struct timeval timeout_quick;
+    timeout_quick.tv_sec = 0;
+    timeout_quick.tv_usec = 250000; // 250ms - balanced for all network types
+
+#ifdef _WIN32
+    int select_result = select(0, NULL, &write_fds, NULL, &timeout_quick);
+#else
+    int select_result = select(sock + 1, NULL, &write_fds, NULL, &timeout_quick);
+#endif
+
+    if (select_result <= 0) {
+        // Timeout or error
+        close(sock);
+        return false;
+    }
+
+    // Check if connection succeeded or failed
+    int sock_error;
+    socklen_t len = sizeof(sock_error);
+#ifdef _WIN32
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&sock_error, &len) != 0) {
+#else
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &sock_error, &len) != 0) {
+#endif
+        close(sock);
+        return false;
+    }
+
+    close(sock);
+    return (sock_error == 0);
+}
+
+socket_t c64u_create_tcp_socket(const char *ip, uint32_t port)
 {
     if (!ip || strlen(ip) == 0) {
         obs_log(LOG_ERROR, "[C64U] Invalid IP address provided");
@@ -553,25 +645,47 @@ socket_t create_tcp_socket(const char *ip, uint32_t port)
         return INVALID_SOCKET_VALUE;
     }
 
-    // Wait for connection with 1-second timeout
+    // Two-stage timeout: fast for local networks, fallback for internet connections
     fd_set write_fds;
     FD_ZERO(&write_fds);
     FD_SET(sock, &write_fds);
 
-    struct timeval timeout;
-    timeout.tv_sec = 1; // 1 second timeout
-    timeout.tv_usec = 0;
+    // First try: 100ms timeout for local network responsiveness
+    struct timeval timeout_fast;
+    timeout_fast.tv_sec = 0;
+    timeout_fast.tv_usec = 100000; // 100 milliseconds
 
 #ifdef _WIN32
-    int select_result = select(0, NULL, &write_fds, NULL, &timeout);
+    int select_result = select(0, NULL, &write_fds, NULL, &timeout_fast);
 #else
-    int select_result = select(sock + 1, NULL, &write_fds, NULL, &timeout);
+    int select_result = select(sock + 1, NULL, &write_fds, NULL, &timeout_fast);
 #endif
+
     if (select_result == 0) {
-        // Timeout
-        obs_log(LOG_WARNING, "[C64U] Connection to C64U at %s:%u timed out after 1 second", ip, port);
-        close(sock);
-        return INVALID_SOCKET_VALUE;
+        // Fast timeout - try longer timeout for internet connections
+        obs_log(LOG_DEBUG, "[C64U] Fast connection attempt to %s:%u timed out, trying slower timeout...", ip, port);
+
+        // Reset the fd_set for second attempt
+        FD_ZERO(&write_fds);
+        FD_SET(sock, &write_fds);
+
+        // Second try: 1.5 second timeout for internet connections
+        struct timeval timeout_slow;
+        timeout_slow.tv_sec = 1;       // 1 second
+        timeout_slow.tv_usec = 500000; // + 500 milliseconds = 1.5s total
+
+#ifdef _WIN32
+        select_result = select(0, NULL, &write_fds, NULL, &timeout_slow);
+#else
+        select_result = select(sock + 1, NULL, &write_fds, NULL, &timeout_slow);
+#endif
+
+        if (select_result == 0) {
+            // Both timeouts failed
+            obs_log(LOG_WARNING, "[C64U] Connection to C64U at %s:%u timed out after 1.6 seconds total", ip, port);
+            close(sock);
+            return INVALID_SOCKET_VALUE;
+        }
     }
 
     if (select_result < 0) {

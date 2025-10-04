@@ -18,10 +18,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include "plugin-support.h"
+#include "c64u-network.h" // Include network header first to avoid Windows header conflicts
 #include "c64u-logging.h"
 #include "c64u-protocol.h"
-#include "c64u-network.h"
 #include "c64u-source.h"
+#include "c64u-version.h"
 
 // Logging control - define the global variable
 bool c64u_debug_logging = true;
@@ -31,7 +32,8 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en")
 
 bool obs_module_load(void)
 {
-    C64U_LOG_INFO("Loading C64U plugin (version %s)", PLUGIN_VERSION);
+    C64U_LOG_INFO("Loading %s", c64u_get_version_string());
+    C64U_LOG_INFO("Build info: %s", c64u_get_build_info());
 
     // DEBUG: This will always be hit when the plugin loads
     // Module loading

@@ -1,0 +1,17 @@
+{
+    "name": "C64 Ultimate OBS Plugin",
+    "short_name": "C64U-OBS",
+    "description": "Stream your Commodore 64 Ultimate directly to OBS Studio",
+    "start_url": "./",
+    "display": "standalone",
+    "background_color": "#667eea",
+    "theme_color": "#764ba2",
+    "icons": [
+        {
+            "src": "images/c64u-obs.png",
+            "sizes": "200x200",
+            "type": "image/png",
+            "purpose": "any maskable"
+        }
+    ]
+}

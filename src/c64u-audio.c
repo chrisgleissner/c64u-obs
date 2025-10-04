@@ -1,10 +1,12 @@
 #include <obs-module.h>
 #include <util/platform.h>
+#include "c64u-network.h" // Include network header first to avoid Windows header conflicts
+
 #include "c64u-logging.h"
 #include "c64u-audio.h"
 #include "c64u-types.h"
 #include "c64u-protocol.h"
-#include "c64u-network.h"
+#include "c64u-video.h"  // For batch statistics processing
 #include "c64u-record.h" // For recording functions
 
 // Audio thread function
@@ -39,57 +41,29 @@ void *audio_thread_func(void *data)
         }
 
         // Update timestamp for timeout detection - UDP packet received successfully
-        pthread_mutex_lock(&context->retry_mutex);
         context->last_udp_packet_time = os_gettime_ns();
-        pthread_mutex_unlock(&context->retry_mutex);
 
         // Parse audio packet
         uint16_t seq_num = *(uint16_t *)(packet);
         int16_t *audio_data = (int16_t *)(packet + C64U_AUDIO_HEADER_SIZE);
 
-        // Technical statistics tracking - Audio
-        static int audio_packet_count = 0;
-        static uint64_t last_audio_log = 0;
-        static uint32_t audio_bytes_period = 0;
-        static uint32_t audio_packets_period = 0;
+        // Update audio statistics
+        context->audio_packets_received++;
+        context->audio_bytes_received += received;
+
+        // Streamlined audio sequence tracking (keep for important audio sync issues)
         static uint16_t last_audio_seq = 0;
-        static uint32_t audio_drops = 0;
         static bool first_audio = true;
 
-        audio_packet_count++;
-        audio_bytes_period += (uint32_t)received; // Cast ssize_t to uint32_t for Windows
-        audio_packets_period++;
-
-        uint64_t audio_now = os_gettime_ns();
-        if (last_audio_log == 0) {
-            last_audio_log = audio_now;
-            C64U_LOG_INFO("🎵 Audio statistics tracking initialized");
-        }
-
-        // Track audio packet drops
         if (!first_audio && seq_num != (uint16_t)(last_audio_seq + 1)) {
-            audio_drops++;
+            C64U_LOG_WARNING("🔊 AUDIO OUT-OF-SEQUENCE: Expected %u, got %u", (uint16_t)(last_audio_seq + 1), seq_num);
         }
         last_audio_seq = seq_num;
         first_audio = false;
 
-        // Log comprehensive audio statistics every 5 seconds
-        uint64_t audio_time_diff = audio_now - last_audio_log;
-        if (audio_time_diff >= 5000000000ULL) {
-            double duration = audio_time_diff / 1000000000.0;
-            double bandwidth_mbps = (audio_bytes_period * 8.0) / (duration * 1000000.0);
-            double pps = audio_packets_period / duration;
-            double loss_pct = audio_packets_period > 0 ? (100.0 * audio_drops) / audio_packets_period : 0.0;
-            double sample_rate = audio_packets_period * 192.0 / duration; // 192 samples per packet
-
-            C64U_LOG_INFO("🔊 AUDIO: %.0f Hz | %.2f Mbps | %.0f pps | Loss: %.1f%% | Packets: %u", sample_rate,
-                          bandwidth_mbps, pps, loss_pct, audio_packet_count);
-
-            // Reset period counters
-            audio_bytes_period = 0;
-            audio_packets_period = 0;
-            last_audio_log = audio_now;
-        }
+        // Batch process audio statistics (moved out of hot path)
+        uint64_t audio_now = os_gettime_ns();
+        c64u_process_audio_statistics_batch(context, audio_now);
 
         // Send audio to OBS (192 stereo samples = 384 16-bit values)
         struct obs_source_audio audio_frame = {0};
@@ -102,8 +76,8 @@ void *audio_thread_func(void *data)
 
         // Record audio data if recording is enabled
         if (context->record_video) {
-            record_audio_data(context, (const uint8_t *)audio_data,
-                              192 * 2 * 2); // 192 stereo samples * 2 bytes per sample
+            c64u_record_audio_data(context, (const uint8_t *)audio_data,
+                                   192 * 2 * 2); // 192 stereo samples * 2 bytes per sample
         }
 
         obs_source_output_audio(context->source, &audio_frame);

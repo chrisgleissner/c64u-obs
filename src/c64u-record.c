@@ -291,7 +291,7 @@ static void cleanup_session_if_needed(struct c64u_source *context)
     }
 }
 
-void save_frame_as_bmp(struct c64u_source *context, uint32_t *frame_buffer)
+void c64u_save_frame_as_bmp(struct c64u_source *context, uint32_t *frame_buffer)
 {
     if (!context->save_frames || !frame_buffer) {
         return;
@@ -419,7 +419,7 @@ void save_frame_as_bmp(struct c64u_source *context, uint32_t *frame_buffer)
 }
 
 // Video recording functions (raw uncompressed format for minimal CPU overhead)
-void start_video_recording(struct c64u_source *context)
+void c64u_start_video_recording(struct c64u_source *context)
 {
     if (!context->record_video || context->video_file) {
         return; // Already recording or not enabled
@@ -490,7 +490,7 @@ void start_video_recording(struct c64u_source *context)
     pthread_mutex_unlock(&context->recording_mutex);
 }
 
-void record_video_frame(struct c64u_source *context, uint32_t *frame_buffer)
+void c64u_record_video_frame(struct c64u_source *context, uint32_t *frame_buffer)
 {
     if (!context->record_video || !context->video_file || !frame_buffer) {
         return;
@@ -573,7 +573,7 @@ void record_video_frame(struct c64u_source *context, uint32_t *frame_buffer)
     pthread_mutex_unlock(&context->recording_mutex);
 }
 
-void record_audio_data(struct c64u_source *context, const uint8_t *audio_data, size_t data_size)
+void c64u_record_audio_data(struct c64u_source *context, const uint8_t *audio_data, size_t data_size)
 {
     if (!context->record_video || !context->audio_file || !audio_data) {
         return;
@@ -598,7 +598,7 @@ void record_audio_data(struct c64u_source *context, const uint8_t *audio_data, s
     pthread_mutex_unlock(&context->recording_mutex);
 }
 
-void stop_video_recording(struct c64u_source *context)
+void c64u_stop_video_recording(struct c64u_source *context)
 {
     if (!context->video_file) {
         return; // Not recording
@@ -714,11 +714,11 @@ void c64u_record_update_settings(struct c64u_source *context, void *settings_ptr
 
         if (new_record_video) {
             // Start recording (will join/create session)
-            start_video_recording(context);
+            c64u_start_video_recording(context);
             C64U_LOG_INFO("Video recording started");
         } else {
             // Stop recording
-            stop_video_recording(context);
+            c64u_stop_video_recording(context);
             cleanup_session_if_needed(context);
         }
     }

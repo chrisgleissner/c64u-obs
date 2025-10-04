@@ -37,8 +37,11 @@ pip3 install gersemi
 
 #### Windows
 - Visual Studio 2022 (Community, Professional, or Enterprise)
-- CMake 3.28+
+- CMake 3.30.5+
 - PowerShell 7+
+- LLVM 19.1.1+ (for clang-format)
+
+**📖 For comprehensive Windows build instructions, see: [`windows-local-build.md`](windows-local-build.md)**
 
 ### Build Types
 
@@ -76,11 +79,20 @@ cmake --build build_macos
 cd build_macos && ctest -V
 ```
 
-**Windows:**
+**Windows:** (See [`windows-local-build.md`](windows-local-build.md) for detailed instructions)
 ```powershell
+# Method 1: Command line (recommended)
 cmake --preset windows-x64
 cmake --build build_x64 --config RelWithDebInfo
 cd build_x64 && ctest -C RelWithDebInfo -V
+
+# Method 2: Visual Studio integration
+# File → Open → CMake... → Select CMakeLists.txt → Build → Build All
+
+# Method 3: CI-compatible build
+$env:CI = "1"
+cmake --preset windows-ci-x64
+cmake --build build_x64 --config RelWithDebInfo --parallel
 ```
 
 #### 2. **CI Simulation Build**
@@ -382,6 +394,51 @@ endif()
 ### Cross-Platform Best Practices
 1. **Use platform detection macros** for conditional compilation
 2. **Abstract differences** behind common interfaces
+
+## Build Verification Requirements
+
+### Before Committing Changes
+
+All code changes that could affect compilation must be verified on both platforms:
+
+#### Linux Verification
+```bash
+# Clean build
+rm -rf build_x86_64
+cmake --preset ubuntu-x86_64
+cmake --build build_x86_64
+
+# Verify success
+ls build_x86_64/c64u-plugin-for-obs.so
+```
+
+#### Windows Verification
+
+**Option 1: Windows simulation (for Linux developers)**
+```bash
+./test-windows-build.sh
+```
+
+**Option 2: Native Windows build**
+```powershell
+Remove-Item "build_x64" -Recurse -Force -ErrorAction SilentlyContinue
+cmake --preset windows-x64
+cmake --build build_x64 --config RelWithDebInfo
+```
+
+See [`windows-local-build.md`](windows-local-build.md) for comprehensive Windows build instructions.
+
+### Code Quality Verification
+
+```bash
+# Format validation (required)
+./build-aux/run-clang-format --check
+./build-aux/run-gersemi --check
+
+# Fix formatting if needed
+./build-aux/run-clang-format
+./build-aux/run-gersemi
+```
 3. **Test on all platforms** regularly
 4. **Handle compiler warnings** consistently
 5. **Use standard C library** when possible

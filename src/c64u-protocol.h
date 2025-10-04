@@ -33,10 +33,6 @@
 struct c64u_source;
 
 // Protocol operations
-void send_control_command(struct c64u_source *context, bool enable, uint8_t stream_id);
-void send_control_command_async(struct c64u_source *context, bool enable, uint8_t stream_id);
-void init_async_retry_system(struct c64u_source *context);
-void shutdown_async_retry_system(struct c64u_source *context);
-void *async_retry_thread(void *data);
+void c64u_send_control_command(struct c64u_source *context, bool enable, uint8_t stream_id);
 
 #endif // C64U_PROTOCOL_H

@@ -5,15 +5,66 @@
 #include <string.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include "c64u-network.h" // Include network header first to avoid Windows header conflicts
+
 #include "c64u-logging.h"
 #include "c64u-source.h"
 #include "c64u-types.h"
 #include "c64u-protocol.h"
 #include "c64u-video.h"
-#include "c64u-network.h"
+#include "c64u-color.h"
 #include "c64u-audio.h"
 #include "c64u-record.h"
+#include "c64u-version.h"
+#include "c64u-properties.h"
 #include "plugin-support.h"
+
+// Forward declarations
+static void close_and_reset_sockets(struct c64u_source *context);
+
+// Async retry task - runs in OBS thread pool (NOT render thread)
+// Based on working 0.4.3 approach but simplified
+static void c64u_async_retry_task(void *data)
+{
+    struct c64u_source *context = (struct c64u_source *)data;
+
+    if (!context) {
+        C64U_LOG_WARNING("Async retry task called with NULL context");
+        return;
+    }
+
+    C64U_LOG_INFO("Async retry attempt %u - %s", context->retry_count,
+                  context->streaming ? "sending start commands" : "starting streaming");
+
+    bool tcp_success = false;
+
+    if (!context->streaming) {
+        // Not streaming - need to create UDP sockets and threads (like 0.4.3)
+        c64u_start_streaming(context);
+        tcp_success = true; // c64u_start_streaming handles TCP commands internally
+    } else {
+        // Already streaming - test connectivity and send start commands (like 0.4.3)
+        // Use quick connectivity test (250ms timeout) instead of blocking TCP socket creation
+        if (c64u_test_connectivity(context->ip_address, C64U_CONTROL_PORT)) {
+            c64u_send_control_command(context, true, 0); // Video
+            c64u_send_control_command(context, true, 1); // Audio
+            tcp_success = true;
+            context->consecutive_failures = 0; // Reset failure counter on success
+        } else {
+            tcp_success = false;
+            context->consecutive_failures++;
+        }
+    }
+
+    context->retry_count++;
+
+    if (!tcp_success) {
+        C64U_LOG_DEBUG("TCP connection failed (%u consecutive failures)", context->consecutive_failures);
+    }
+
+    // Clear retry state - allows future retries
+    context->retry_in_progress = false;
+}
 
 // Helper function to safely close and reset sockets
 static void close_and_reset_sockets(struct c64u_source *context)
@@ -71,6 +122,13 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
             return NULL;
         }
         networking_initialized = true;
+    }
+
+    // Initialize color conversion optimization on first use
+    static bool color_lut_initialized = false;
+    if (!color_lut_initialized) {
+        c64u_init_color_conversion_lut();
+        color_lut_initialized = true;
     }
 
     struct c64u_source *context = bzalloc(sizeof(struct c64u_source));
@@ -221,34 +279,33 @@ void *c64u_create(obs_data_t *settings, obs_source_t *source)
     context->audio_thread_active = false;
     context->auto_start_attempted = false;
 
-    // Initialize async retry system fields
-    context->retry_thread_active = false;
-    context->needs_retry = false;
+    // Initialize statistics counters
+    context->video_packets_received = 0;
+    context->video_bytes_received = 0;
+    context->video_sequence_errors = 0;
+    context->video_frames_processed = 0;
+    context->audio_packets_received = 0;
+    context->audio_bytes_received = 0;
+    context->last_stats_log_time = os_gettime_ns();
+
+    // Initialize render callback timeout system
+    uint64_t now = os_gettime_ns();
+    context->last_udp_packet_time = now;
+    context->retry_in_progress = false;
     context->retry_count = 0;
     context->consecutive_failures = 0;
-    context->retry_shutdown = false;
-    context->last_udp_packet_time = os_gettime_ns();
 
     // Initialize logo display
     context->logo_texture = NULL;
     context->logo_load_attempted = false;
 
-    // Initialize recording module
+    // Initialize recording for this source
     c64u_record_init(context);
 
-    // Apply recording settings from OBS
-    c64u_record_update_settings(context, settings);
-
-    C64U_LOG_INFO("C64U source created - C64U host: %s (IP: %s), OBS IP: %s, Video: %u, Audio: %u", context->hostname,
-                  context->ip_address, context->obs_ip_address, context->video_port, context->audio_port);
-
-    // Initialize async retry system immediately to start continuous retry attempts
-    init_async_retry_system(context);
-
-    // Mark that we want to start streaming, but don't block OBS startup
-    // The async retry system will continuously attempt connection
-    C64U_LOG_INFO("🚀 C64U source created - async retry system will continuously attempt connection");
-    context->auto_start_attempted = false; // Will be handled by async mechanism
+    // Start initial connection asynchronously to avoid blocking OBS startup
+    C64U_LOG_INFO("C64U source created successfully - queuing async initial connection");
+    context->retry_in_progress = true; // Prevent render thread from also starting retry
+    obs_queue_task(OBS_TASK_UI, c64u_async_retry_task, context, false);
 
     return context;
 }
@@ -261,8 +318,7 @@ void c64u_destroy(void *data)
 
     C64U_LOG_INFO("Destroying C64U source");
 
-    // Shutdown async retry system first
-    shutdown_async_retry_system(context);
+    // No retry thread to shutdown - using async delegation approach
 
     // Stop streaming if active
     if (context->streaming) {
@@ -286,10 +342,8 @@ void c64u_destroy(void *data)
         }
     }
 
-    // Cleanup recording module
     c64u_record_cleanup(context);
 
-    // Cleanup logo texture
     if (context->logo_texture) {
         gs_texture_destroy(context->logo_texture);
         context->logo_texture = NULL;
@@ -434,19 +488,15 @@ void c64u_start_streaming(struct c64u_source *context)
         return;
     }
 
-    // If already streaming, trigger async retry (no TCP calls in OBS thread)
-    if (context->streaming) {
-        C64U_LOG_INFO("Already streaming - triggering async start commands with current config");
-        send_control_command_async(context, true, 0); // Start video async
-        return;
-    }
-
     C64U_LOG_INFO("Starting C64U streaming to C64 %s (OBS IP: %s, video:%u, audio:%u)...", context->ip_address,
                   context->obs_ip_address, context->video_port, context->audio_port);
 
-    // Create UDP sockets
-    context->video_socket = create_udp_socket(context->video_port);
-    context->audio_socket = create_udp_socket(context->audio_port);
+    // Always close existing sockets before creating new ones (handles reconnection case)
+    close_and_reset_sockets(context);
+
+    // Create fresh UDP sockets (critical for reconnection after C64U restart)
+    context->video_socket = c64u_create_udp_socket(context->video_port);
+    context->audio_socket = c64u_create_udp_socket(context->audio_port);
 
     if (context->video_socket == INVALID_SOCKET_VALUE || context->audio_socket == INVALID_SOCKET_VALUE) {
         C64U_LOG_ERROR("Failed to create UDP sockets for streaming");
@@ -454,17 +504,31 @@ void c64u_start_streaming(struct c64u_source *context)
         return;
     }
 
-    // Send start commands to C64U asynchronously (async system already initialized in create)
-    send_control_command_async(context, true, 0); // Start video async
-    send_control_command_async(context, true, 1); // Start audio async
+    // Send start commands to C64U
+    c64u_send_control_command(context, true, 0); // Start video
+    c64u_send_control_command(context, true, 1); // Start audio
 
-    // Start worker threads
+    // Stop existing threads before creating new ones (handles reconnection case)
+    if (context->streaming) {
+        context->streaming = false;
+        context->thread_active = false;
+
+        // Wait for existing threads to finish
+        if (context->video_thread_active && pthread_join(context->video_thread, NULL) != 0) {
+            C64U_LOG_WARNING("Failed to join existing video thread during reconnection");
+        }
+        if (context->audio_thread_active && pthread_join(context->audio_thread, NULL) != 0) {
+            C64U_LOG_WARNING("Failed to join existing audio thread during reconnection");
+        }
+        context->video_thread_active = false;
+        context->audio_thread_active = false;
+    }
+
+    // Start fresh worker threads
     context->thread_active = true;
     context->streaming = true;
-    context->video_thread_active = false;
-    context->audio_thread_active = false;
 
-    if (pthread_create(&context->video_thread, NULL, video_thread_func, context) != 0) {
+    if (pthread_create(&context->video_thread, NULL, c64u_video_thread_func, context) != 0) {
         C64U_LOG_ERROR("Failed to create video receiver thread");
         context->streaming = false;
         context->thread_active = false;
@@ -487,7 +551,7 @@ void c64u_start_streaming(struct c64u_source *context)
     context->audio_thread_active = true;
 
     // Initialize delay queue for rendering delay
-    init_delay_queue(context);
+    c64u_init_delay_queue(context);
 
     C64U_LOG_INFO("C64U streaming started successfully");
 }
@@ -549,7 +613,7 @@ void c64u_stop_streaming(struct c64u_source *context)
     }
 
     // Clear delay queue
-    clear_delay_queue(context);
+    c64u_clear_delay_queue(context);
 
     C64U_LOG_INFO("C64U streaming stopped");
 }
@@ -574,22 +638,45 @@ void c64u_render(void *data, gs_effect_t *effect)
     // 1. Not streaming, OR
     // 2. No frames ready, OR
     // 3. No frame buffer, OR
-    // 4. Frames have timed out (no new frames for 1 second)
+    // 4. Frames have timed out (no new frames for timeout period)
     uint64_t now = os_gettime_ns();
     bool frames_timed_out = false;
-    if (context->frame_ready && context->last_frame_time > 0) {
+    bool needs_initial_connection = false;
+
+    if (context->last_frame_time > 0) {
+        // We have received frames before - check for timeout regardless of frame_ready state
         uint64_t frame_age = now - context->last_frame_time;
         frames_timed_out = (frame_age > C64U_FRAME_TIMEOUT_NS);
+    } else {
+        // No frames received yet - need initial connection (regardless of streaming flag)
+        // This handles both: OBS started first, and failed connection attempts
+        needs_initial_connection = true;
+    }
 
-        // Trigger async retry when frames timeout
-        if (frames_timed_out) {
-            // Update last UDP packet time to current time to reset detection
-            pthread_mutex_lock(&context->retry_mutex);
-            context->last_udp_packet_time = now;
-            context->needs_retry = true;
-            pthread_cond_signal(&context->retry_cond);
-            pthread_mutex_unlock(&context->retry_mutex);
+    // Simple retry detection: render thread detects need, delegates to async task
+    if (frames_timed_out || needs_initial_connection) {
+        static uint64_t last_retry_time = 0;
+        uint64_t time_since_last_retry = now - last_retry_time;
+
+        // Simple timing: 1 second between retries, no complex backoff needed
+        // The async task will handle the actual TCP timeouts and failures
+        bool should_retry = (time_since_last_retry >= 1000000000ULL) &&  // 1 second between retries
+                            !context->retry_in_progress &&               // Don't overlap retries
+                            strcmp(context->ip_address, "0.0.0.0") != 0; // Valid IP configured
+
+        if (should_retry) {
+            last_retry_time = now;
+            context->retry_in_progress = true;
+
+            // Just delegate to async task - keep render thread fast
+            C64U_LOG_INFO("� Connection needed - delegating to async task");
+            obs_queue_task(OBS_TASK_UI, c64u_async_retry_task, context, false);
         }
+    } else if (context->frame_ready && context->last_frame_time > 0) {
+        // Frames are arriving normally - reset retry counters
+        context->retry_in_progress = false;
+        context->retry_count = 0;
+        context->consecutive_failures = 0;
     }
 
     bool should_show_logo = !context->streaming || !context->frame_ready || !context->frame_buffer_front ||
@@ -780,116 +867,10 @@ const char *c64u_get_name(void *unused)
 
 obs_properties_t *c64u_properties(void *data)
 {
-    // C64U properties setup
-    UNUSED_PARAMETER(data);
-
-    obs_properties_t *props = obs_properties_create();
-
-    // Debug logging toggle
-    obs_property_t *debug_prop = obs_properties_add_bool(props, "debug_logging", "Debug Logging");
-    obs_property_set_long_description(debug_prop, "Enable detailed logging for debugging connection issues");
-
-    // Network Configuration Group
-    obs_property_t *network_group = obs_properties_add_group(props, "network_group", "Network Configuration",
-                                                             OBS_GROUP_NORMAL, obs_properties_create());
-    obs_properties_t *network_props = obs_property_group_content(network_group);
-
-    // DNS Server IP (first property in network group)
-    obs_property_t *dns_prop =
-        obs_properties_add_text(network_props, "dns_server_ip", obs_module_text("DNSServerIP"), OBS_TEXT_DEFAULT);
-    obs_property_set_long_description(dns_prop, obs_module_text("DNSServerIP.Description"));
-
-    // C64U Host (IP Address or Hostname)
-    obs_property_t *host_prop = obs_properties_add_text(network_props, "c64u_host", "C64U Host", OBS_TEXT_DEFAULT);
-    obs_property_set_long_description(
-        host_prop,
-        "Hostname or IP address of C64 Ultimate device (default: c64u). Use 0.0.0.0 to skip control commands.");
-
-    // OBS IP Address (editable)
-    obs_property_t *obs_ip_prop =
-        obs_properties_add_text(network_props, "obs_ip_address", "OBS Server IP", OBS_TEXT_DEFAULT);
-    obs_property_set_long_description(obs_ip_prop, "IP address of this OBS server (where C64 Ultimate sends streams)");
-
-    // Auto-detect IP toggle
-    obs_property_t *auto_ip_prop = obs_properties_add_bool(network_props, "auto_detect_ip", "Auto-detect OBS IP");
-    obs_property_set_long_description(auto_ip_prop, "Automatically detect and use OBS server IP in streaming commands");
-
-    // UDP Ports within the same network group
-    obs_property_t *video_port_prop = obs_properties_add_int(network_props, "video_port", "Video Port", 1024, 65535, 1);
-    obs_property_set_long_description(video_port_prop, "UDP port for video stream from C64 Ultimate");
-
-    obs_property_t *audio_port_prop = obs_properties_add_int(network_props, "audio_port", "Audio Port", 1024, 65535, 1);
-    obs_property_set_long_description(audio_port_prop, "UDP port for audio stream from C64 Ultimate");
-
-    // Rendering Delay
-    obs_property_t *delay_prop = obs_properties_add_int_slider(props, "render_delay_frames", "Render Delay (frames)", 0,
-                                                               C64U_MAX_RENDER_DELAY_FRAMES, 1);
-    obs_property_set_long_description(
-        delay_prop, "Delay frames before rendering to smooth UDP packet loss/reordering (default: 3)");
-
-    // Recording Group (compact layout)
-    obs_property_t *recording_group =
-        obs_properties_add_group(props, "recording_group", "Recording", OBS_GROUP_NORMAL, obs_properties_create());
-    obs_properties_t *recording_props = obs_property_group_content(recording_group);
-
-    obs_property_t *save_frames_prop = obs_properties_add_bool(recording_props, "save_frames", "☐ Save BMP Frames");
-    obs_property_set_long_description(
-        save_frames_prop, "Save each frame as BMP in frames/ subfolder (for debugging - impacts performance)");
-
-    obs_property_t *record_video_prop = obs_properties_add_bool(recording_props, "record_video", "☐ Record AVI + WAV");
-    obs_property_set_long_description(record_video_prop,
-                                      "Record uncompressed AVI video + WAV audio (for debugging - high disk usage)");
-
-    // Save Folder (applies to both frame saving and video recording) - now properly in Recording group
-    obs_property_t *save_folder_prop =
-        obs_properties_add_path(recording_props, "save_folder", "Output Folder", OBS_PATH_DIRECTORY, NULL, NULL);
-    obs_property_set_long_description(
-        save_folder_prop,
-        "Directory where session folders with frames, video, audio, and timing files will be created");
-
-    return props;
+    return c64u_create_properties(data);
 }
 
 void c64u_defaults(obs_data_t *settings)
 {
-    // C64U defaults initialization
-
-    obs_data_set_default_bool(settings, "debug_logging", true);
-    obs_data_set_default_bool(settings, "auto_detect_ip", true);
-    obs_data_set_default_string(settings, "dns_server_ip", "192.168.1.1");
-    obs_data_set_default_string(settings, "c64u_host", C64U_DEFAULT_HOST);
-    obs_data_set_default_string(settings, "obs_ip_address", ""); // Empty by default, will be auto-detected
-    obs_data_set_default_int(settings, "video_port", C64U_DEFAULT_VIDEO_PORT);
-    obs_data_set_default_int(settings, "audio_port", C64U_DEFAULT_AUDIO_PORT);
-    obs_data_set_default_int(settings, "render_delay_frames", C64U_DEFAULT_RENDER_DELAY_FRAMES);
-
-    // Frame saving defaults
-    obs_data_set_default_bool(settings, "save_frames", false); // Disabled by default
-
-    // Platform-specific default recording folder (absolute paths to avoid tilde expansion issues)
-    char platform_path[512];
-    char documents_path[256];
-
-    if (c64u_get_user_documents_path(documents_path, sizeof(documents_path))) {
-        // Successfully got user's Documents folder
-#ifdef _WIN32
-        snprintf(platform_path, sizeof(platform_path), "%s\\obs-studio\\c64u\\recordings", documents_path);
-#else
-        snprintf(platform_path, sizeof(platform_path), "%s/obs-studio/c64u/recordings", documents_path);
-#endif
-    } else {
-        // Fallback to platform-specific defaults
-#ifdef _WIN32
-        strcpy(platform_path, "C:\\Users\\Public\\Documents\\obs-studio\\c64u\\recordings");
-#elif defined(__APPLE__)
-        strcpy(platform_path, "/Users/user/Documents/obs-studio/c64u/recordings");
-#else // Linux and other Unix-like systems
-        strcpy(platform_path, "/home/user/Documents/obs-studio/c64u/recordings");
-#endif
-    }
-
-    obs_data_set_default_string(settings, "save_folder", platform_path);
-
-    // Video recording defaults
-    obs_data_set_default_bool(settings, "record_video", false); // Disabled by default
+    c64u_set_property_defaults(settings);
 }

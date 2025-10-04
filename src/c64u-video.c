@@ -2,73 +2,54 @@
 #include <util/platform.h>
 #include <string.h>
 #include <pthread.h>
+#include "c64u-network.h" // Include network header first to avoid Windows header conflicts
+
 #include "c64u-logging.h"
 #include "c64u-video.h"
+#include "c64u-color.h"
 #include "c64u-types.h"
 #include "c64u-protocol.h"
-#include "c64u-network.h"
 #include "c64u-record.h"
 
 #ifdef _WIN32
-#include <windows.h>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib") // For timeBeginPeriod/timeEndPeriod
 #endif
 
 #include "c64u-protocol.h"
 
-// VIC-II color palette (16 colors) in RGBA format
-const uint32_t vic_colors[16] = {
-    0xFF000000, // 0: Black
-    0xFFEFEFEF, // 1: White
-    0xFF342F8D, // 2: Red
-    0xFFCDD46A, // 3: Cyan
-    0xFFA43598, // 4: Purple/Magenta
-    0xFF42B44C, // 5: Green
-    0xFFB1292C, // 6: Blue
-    0xFF5DEFEF, // 7: Yellow
-    0xFF204E98, // 8: Orange
-    0xFF00385B, // 9: Brown
-    0xFF6D67D1, // 10: Light Red
-    0xFF4A4A4A, // 11: Dark Grey
-    0xFF7B7B7B, // 12: Mid Grey
-    0xFF93EF9F, // 13: Light Green
-    0xFFEF6A6D, // 14: Light Blue
-    0xFFB2B2B2  // 15: Light Grey
-};
-
-// Helper functions for frame assembly
-void init_frame_assembly(struct frame_assembly *frame, uint16_t frame_num)
+// Helper functions for frame assembly (updated to use lock-free implementation)
+void c64u_init_frame_assembly(struct frame_assembly *frame, uint16_t frame_num)
 {
-    memset(frame, 0, sizeof(struct frame_assembly));
-    frame->frame_num = frame_num;
-    frame->start_time = os_gettime_ns();
+    // Delegate to lock-free implementation for performance
+    c64u_init_frame_assembly_lockfree(frame, frame_num);
 }
 
-bool is_frame_complete(struct frame_assembly *frame)
+bool c64u_is_frame_complete(struct frame_assembly *frame)
 {
-    return frame->received_packets > 0 && frame->received_packets == frame->expected_packets;
+    // Delegate to lock-free implementation for performance
+    return c64u_is_frame_complete_lockfree(frame);
 }
 
-bool is_frame_timeout(struct frame_assembly *frame)
+bool c64u_is_frame_timeout(struct frame_assembly *frame)
 {
     uint64_t elapsed = (os_gettime_ns() - frame->start_time) / 1000000; // Convert to ms
     return elapsed > C64U_FRAME_TIMEOUT_MS;
 }
 
-void swap_frame_buffers(struct c64u_source *context)
+void c64u_swap_frame_buffers(struct c64u_source *context)
 {
     // Save frame to disk if enabled (before swap to avoid race conditions)
     if (context->save_frames) {
-        save_frame_as_bmp(context, context->frame_buffer_back);
+        c64u_save_frame_as_bmp(context, context->frame_buffer_back);
     }
 
     // Record frame to video file if recording is enabled
     if (context->record_video) {
-        record_video_frame(context, context->frame_buffer_back);
+        c64u_record_video_frame(context, context->frame_buffer_back);
     }
 
-    // Atomically swap front and back buffers
+    // Swap front and back buffers
     uint32_t *temp = context->frame_buffer_front;
     context->frame_buffer_front = context->frame_buffer_back;
     context->frame_buffer_back = temp;
@@ -77,7 +58,7 @@ void swap_frame_buffers(struct c64u_source *context)
     context->buffer_swap_pending = false;
 }
 
-void assemble_frame_to_buffer(struct c64u_source *context, struct frame_assembly *frame)
+void c64u_assemble_frame_to_buffer(struct c64u_source *context, struct frame_assembly *frame)
 {
     // Assemble complete frame into back buffer
     for (int i = 0; i < C64U_MAX_PACKETS_PER_FRAME; i++) {
@@ -92,21 +73,14 @@ void assemble_frame_to_buffer(struct c64u_source *context, struct frame_assembly
             uint32_t *dst_line = context->frame_buffer_back + ((line_num + line) * C64U_PIXELS_PER_LINE);
             uint8_t *src_line = packet->packet_data + (line * C64U_BYTES_PER_LINE);
 
-            // Convert 4-bit VIC colors to 32-bit RGBA
-            for (int x = 0; x < C64U_BYTES_PER_LINE; x++) {
-                uint8_t pixel_pair = src_line[x];
-                uint8_t color1 = pixel_pair & 0x0F;
-                uint8_t color2 = pixel_pair >> 4;
-
-                dst_line[x * 2] = vic_colors[color1];
-                dst_line[x * 2 + 1] = vic_colors[color2];
-            }
+            // Optimized color conversion using lookup table
+            c64u_convert_pixels_optimized(src_line, dst_line, C64U_BYTES_PER_LINE);
         }
     }
 }
 
 // Delay queue management functions
-void init_delay_queue(struct c64u_source *context)
+void c64u_init_delay_queue(struct c64u_source *context)
 {
     if (pthread_mutex_lock(&context->delay_mutex) == 0) {
         // Allocate delay queue buffers if needed (max delay + buffer)
@@ -148,7 +122,7 @@ void init_delay_queue(struct c64u_source *context)
     }
 }
 
-bool enqueue_delayed_frame(struct c64u_source *context, struct frame_assembly *frame, uint16_t sequence_num)
+bool c64u_enqueue_delayed_frame(struct c64u_source *context, struct frame_assembly *frame, uint16_t sequence_num)
 {
     if (pthread_mutex_lock(&context->delay_mutex) != 0) {
         return false;
@@ -157,7 +131,7 @@ bool enqueue_delayed_frame(struct c64u_source *context, struct frame_assembly *f
     // Initialize delay queue if not already done
     if (context->delayed_frame_queue == NULL) {
         pthread_mutex_unlock(&context->delay_mutex);
-        init_delay_queue(context);
+        c64u_init_delay_queue(context);
         if (pthread_mutex_lock(&context->delay_mutex) != 0) {
             return false;
         }
@@ -194,15 +168,8 @@ bool enqueue_delayed_frame(struct c64u_source *context, struct frame_assembly *f
             uint32_t *dst_line = queue_frame + ((line_num + line) * C64U_PIXELS_PER_LINE);
             uint8_t *src_line = packet->packet_data + (line * C64U_BYTES_PER_LINE);
 
-            // Convert 4-bit VIC colors to 32-bit RGBA
-            for (int x = 0; x < C64U_BYTES_PER_LINE; x++) {
-                uint8_t pixel_pair = src_line[x];
-                uint8_t color1 = pixel_pair & 0x0F;
-                uint8_t color2 = pixel_pair >> 4;
-
-                dst_line[x * 2] = vic_colors[color1];
-                dst_line[x * 2 + 1] = vic_colors[color2];
-            }
+            // Optimized color conversion using lookup table
+            c64u_convert_pixels_optimized(src_line, dst_line, C64U_BYTES_PER_LINE);
         }
     }
 
@@ -214,7 +181,7 @@ bool enqueue_delayed_frame(struct c64u_source *context, struct frame_assembly *f
     return true;
 }
 
-bool dequeue_delayed_frame(struct c64u_source *context)
+bool c64u_dequeue_delayed_frame(struct c64u_source *context)
 {
     if (pthread_mutex_lock(&context->delay_mutex) != 0) {
         return false;
@@ -248,7 +215,7 @@ bool dequeue_delayed_frame(struct c64u_source *context)
     return false;
 }
 
-void clear_delay_queue(struct c64u_source *context)
+void c64u_clear_delay_queue(struct c64u_source *context)
 {
     if (pthread_mutex_lock(&context->delay_mutex) == 0) {
         context->delay_queue_size = 0;
@@ -258,12 +225,162 @@ void clear_delay_queue(struct c64u_source *context)
     }
 }
 
+// Performance optimization: Batch process video statistics to reduce hot path overhead
+void c64u_process_video_statistics_batch(struct c64u_source *context, uint64_t current_time)
+{
+    // Only process statistics every 5 seconds to minimize overhead
+    static const uint64_t STATS_INTERVAL_NS = 5000000000ULL; // 5 seconds
+
+    uint64_t time_since_last_log = current_time - context->last_stats_log_time;
+    if (time_since_last_log < STATS_INTERVAL_NS) {
+        return; // Not time yet for statistics processing
+    }
+
+    // Read and reset counters (no atomics needed - single threaded access per counter type)
+    uint64_t packets_received = context->video_packets_received;
+    uint64_t bytes_received = context->video_bytes_received;
+    uint32_t sequence_errors = context->video_sequence_errors;
+    uint32_t frames_processed = context->video_frames_processed;
+    context->video_packets_received = 0;
+    context->video_bytes_received = 0;
+    context->video_sequence_errors = 0;
+    context->video_frames_processed = 0;
+
+    // Calculate rates and statistics
+    double duration_seconds = time_since_last_log / 1000000000.0;
+    double packets_per_second = packets_received / duration_seconds;
+    double bandwidth_mbps = (bytes_received * 8.0) / (duration_seconds * 1000000.0);
+    double frames_per_second = frames_processed / duration_seconds;
+    double loss_percentage = packets_received > 0 ? (100.0 * sequence_errors) / packets_received : 0.0;
+
+    // Calculate frame delivery metrics
+    double expected_fps = context->format_detected ? context->expected_fps : 50.0; // Default to PAL
+    double frame_delivery_rate = context->frames_delivered_to_obs / duration_seconds;
+    double frame_completion_rate = context->frames_completed / duration_seconds;
+    double capture_drop_pct =
+        context->frames_expected > 0
+            ? (100.0 * (context->frames_expected - context->frames_captured)) / context->frames_expected
+            : 0.0;
+    double delivery_drop_pct =
+        context->frames_completed > 0
+            ? (100.0 * (context->frames_completed - context->frames_delivered_to_obs)) / context->frames_completed
+            : 0.0;
+    double avg_pipeline_latency = context->frames_delivered_to_obs > 0
+                                      ? context->total_pipeline_latency / (context->frames_delivered_to_obs * 1000000.0)
+                                      : 0.0; // Convert to ms
+
+    // Log comprehensive statistics (only if we received packets)
+    if (packets_received > 0) {
+        C64U_LOG_INFO("📺 VIDEO: %.1f fps | %.2f Mbps | %.0f pps | Loss: %.1f%% | Frames: %u", frames_per_second,
+                      bandwidth_mbps, packets_per_second, loss_percentage, (uint32_t)frames_processed);
+        C64U_LOG_INFO("🎯 DELIVERY: Expected %.0f fps | Captured %.1f fps | Delivered %.1f fps | Completed %.1f fps",
+                      expected_fps, context->frames_captured / duration_seconds, frame_delivery_rate,
+                      frame_completion_rate);
+        C64U_LOG_INFO(
+            "📊 PIPELINE: Capture drops %.1f%% | Delivery drops %.1f%% | Avg latency %.1f ms | Buffer swaps %u",
+            capture_drop_pct, delivery_drop_pct, avg_pipeline_latency, context->buffer_swaps);
+    }
+
+    // Reset diagnostic counters and update timestamp
+    context->frames_expected = 0;
+    context->frames_captured = 0;
+    context->frames_delivered_to_obs = 0;
+    context->frames_completed = 0;
+    context->buffer_swaps = 0;
+    context->total_pipeline_latency = 0;
+    context->last_stats_log_time = current_time;
+}
+
+// Performance optimization: Batch process audio statistics
+void c64u_process_audio_statistics_batch(struct c64u_source *context, uint64_t current_time)
+{
+    static const uint64_t STATS_INTERVAL_NS = 5000000000ULL; // 5 seconds
+
+    uint64_t time_since_last_log = current_time - context->last_stats_log_time;
+    if (time_since_last_log < STATS_INTERVAL_NS) {
+        return; // Not time yet for statistics processing
+    }
+
+    // Read and reset audio counters
+    uint64_t packets_received = context->audio_packets_received;
+    uint64_t bytes_received = context->audio_bytes_received;
+    context->audio_packets_received = 0;
+    context->audio_bytes_received = 0;
+
+    if (packets_received > 0) {
+        double duration_seconds = time_since_last_log / 1000000000.0;
+        double packets_per_second = packets_received / duration_seconds;
+        double bandwidth_mbps = (bytes_received * 8.0) / (duration_seconds * 1000000.0);
+
+        C64U_LOG_INFO("🔊 AUDIO: %.2f Mbps | %.0f pps | Packets: %llu", bandwidth_mbps, packets_per_second,
+                      (unsigned long long)packets_received);
+    }
+}
+
+// Lock-free frame assembly optimization functions
+void c64u_init_frame_assembly_lockfree(struct frame_assembly *frame, uint16_t frame_num)
+{
+    // Initialize frame structure
+    memset(frame, 0, sizeof(struct frame_assembly));
+    frame->frame_num = frame_num;
+    frame->start_time = os_gettime_ns();
+    frame->received_packets = 0;
+    frame->complete = false;
+    frame->packets_received_mask = 0;
+}
+
+bool c64u_try_add_packet_lockfree(struct frame_assembly *frame, uint16_t packet_index)
+{
+    // Check if packet index is valid
+    if (packet_index >= C64U_MAX_PACKETS_PER_FRAME) {
+        return false;
+    }
+
+    // Set the packet bit and increment counter
+    uint64_t packet_mask = 1ULL << packet_index;
+    uint64_t old_mask = frame->packets_received_mask;
+    frame->packets_received_mask |= packet_mask;
+
+    // If this bit was already set, this is a duplicate packet
+    if (old_mask & packet_mask) {
+        return false; // Duplicate packet
+    }
+
+    // Increment packet counter
+    frame->received_packets++;
+
+    return true; // Successfully added new packet
+}
+
+bool c64u_is_frame_complete_lockfree(struct frame_assembly *frame)
+{
+    // Load current packet count
+    uint16_t received = frame->received_packets;
+
+    // Frame is complete when we have all expected packets
+    // For PAL: 68 packets (272 lines / 4 lines per packet)
+    // For NTSC: 60 packets (240 lines / 4 lines per packet)
+    uint16_t expected = frame->expected_packets;
+    if (expected == 0) {
+        // Auto-detect based on received packet pattern
+        expected = 68; // Default to PAL, could be refined based on actual data
+    }
+
+    bool complete = (received >= expected);
+
+    // Update completion flag if frame is complete
+    if (complete) {
+        frame->complete = true;
+    }
+
+    return complete;
+}
+
 // Video thread function
-void *video_thread_func(void *data)
+void *c64u_video_thread_func(void *data)
 {
     struct c64u_source *context = data;
     uint8_t packet[C64U_VIDEO_PACKET_SIZE];
-    static int packet_count = 0;
 
     C64U_LOG_DEBUG("Video receiver thread started on port %u", context->video_port);
 
@@ -313,121 +430,49 @@ void *video_thread_func(void *data)
         }
 
         // Update timestamp for timeout detection - UDP packet received successfully
-        pthread_mutex_lock(&context->retry_mutex);
         context->last_udp_packet_time = os_gettime_ns();
-        pthread_mutex_unlock(&context->retry_mutex);
 
-        // Debug: Count received packets
-        packet_count++;
-        // Technical statistics tracking - Video
-        static uint64_t last_video_log = 0;
-        static uint32_t video_bytes_period = 0;
-        static uint32_t video_packets_period = 0;
-        static uint16_t last_video_seq = 0;
-        static uint32_t video_drops = 0;
-        static uint32_t video_frames = 0;
-        static bool first_video = true;
+        // Update statistics counters (video thread only access)
+        context->video_packets_received++;
+        context->video_bytes_received += received;
 
-        // Parse packet header
+        // Parse packet header (streamlined - only what we need for processing)
         uint16_t seq_num = *(uint16_t *)(packet + 0);
         uint16_t frame_num = *(uint16_t *)(packet + 2);
         uint16_t line_num = *(uint16_t *)(packet + 4);
         uint16_t pixels_per_line = *(uint16_t *)(packet + 6);
         uint8_t lines_per_packet = packet[8];
         uint8_t bits_per_pixel = packet[9];
-        uint16_t encoding = *(uint16_t *)(packet + 10);
-
-        UNUSED_PARAMETER(frame_num);
-        UNUSED_PARAMETER(pixels_per_line);
-        UNUSED_PARAMETER(bits_per_pixel);
-        UNUSED_PARAMETER(encoding);
 
         bool last_packet = (line_num & 0x8000) != 0;
         line_num &= 0x7FFF;
 
-        // Update video statistics
-        video_bytes_period += (uint32_t)received; // Cast ssize_t to uint32_t for Windows
-        video_packets_period++;
+        // Streamlined sequence error tracking
+        static uint16_t last_video_seq = 0;
+        static bool first_video = true;
 
-        uint64_t now = os_gettime_ns();
-        if (last_video_log == 0) {
-            last_video_log = now;
-            C64U_LOG_INFO("� Video statistics tracking initialized");
-        }
-
-        // Track packet drops (seq_num should increment by 1)
         if (!first_video && seq_num != (uint16_t)(last_video_seq + 1)) {
+            // Increment sequence error counter
+            context->video_sequence_errors++;
+
+            // Log sequence errors (keep for debugging, but move details out of hot path)
             uint16_t expected_seq = (uint16_t)(last_video_seq + 1);
             int16_t seq_diff = (int16_t)(seq_num - expected_seq);
 
-            video_drops++;
-
             if (seq_diff > 0) {
-                // Packets skipped - likely packet loss
-                C64U_LOG_WARNING(
-                    "🔴 UDP OUT-OF-SEQUENCE: Expected seq %u, got %u (skipped %d packets) - Frame %u, Line %u",
-                    expected_seq, seq_num, seq_diff, frame_num, line_num);
+                C64U_LOG_WARNING("🔴 UDP OUT-OF-SEQUENCE: Expected seq %u, got %u (skipped %d packets)", expected_seq,
+                                 seq_num, seq_diff);
             } else {
-                // Negative difference - likely duplicate or severely reordered packet
-                C64U_LOG_WARNING("🔄 UDP OUT-OF-ORDER: Expected seq %u, got %u (reorder offset %d) - Frame %u, Line %u",
-                                 expected_seq, seq_num, seq_diff, frame_num, line_num);
+                C64U_LOG_WARNING("🔄 UDP OUT-OF-ORDER: Expected seq %u, got %u (reorder offset %d)", expected_seq,
+                                 seq_num, seq_diff);
             }
         }
         last_video_seq = seq_num;
         first_video = false;
 
-        // NOTE: Frame counting is now done only in frame assembly completion logic
-        // Do not count frames here based on last_packet flag as it creates duplicate counting
-
-        // Log comprehensive video statistics every 5 seconds
-        uint64_t time_diff = now - last_video_log;
-        if (time_diff >= 5000000000ULL) {
-            double duration = time_diff / 1000000000.0;
-            double bandwidth_mbps = (video_bytes_period * 8.0) / (duration * 1000000.0);
-            double pps = video_packets_period / duration;
-            double fps = video_frames / duration;
-            double loss_pct = video_packets_period > 0 ? (100.0 * video_drops) / video_packets_period : 0.0;
-
-            // Calculate frame delivery metrics (Stats for Nerds style)
-            double expected_fps = context->format_detected ? context->expected_fps
-                                                           : 50.0; // Default to PAL if not detected yet
-            double frame_delivery_rate = context->frames_delivered_to_obs / duration;
-            double frame_completion_rate = context->frames_completed / duration;
-            double capture_drop_pct =
-                context->frames_expected > 0
-                    ? (100.0 * (context->frames_expected - context->frames_captured)) / context->frames_expected
-                    : 0.0;
-            double delivery_drop_pct = context->frames_completed > 0
-                                           ? (100.0 * (context->frames_completed - context->frames_delivered_to_obs)) /
-                                                 context->frames_completed
-                                           : 0.0;
-            double avg_pipeline_latency =
-                context->frames_delivered_to_obs > 0
-                    ? context->total_pipeline_latency / (context->frames_delivered_to_obs * 1000000.0)
-                    : 0.0; // Convert to ms
-
-            C64U_LOG_INFO("📺 VIDEO: %.1f fps | %.2f Mbps | %.0f pps | Loss: %.1f%% | Frames: %u", fps, bandwidth_mbps,
-                          pps, loss_pct, video_frames);
-            C64U_LOG_INFO(
-                "🎯 DELIVERY: Expected %.0f fps | Captured %.1f fps | Delivered %.1f fps | Completed %.1f fps",
-                expected_fps, context->frames_captured / duration, frame_delivery_rate, frame_completion_rate);
-            C64U_LOG_INFO(
-                "📊 PIPELINE: Capture drops %.1f%% | Delivery drops %.1f%% | Avg latency %.1f ms | Buffer swaps %u",
-                capture_drop_pct, delivery_drop_pct, avg_pipeline_latency, context->buffer_swaps);
-
-            // Reset period counters
-            video_bytes_period = 0;
-            video_packets_period = 0;
-            video_frames = 0;
-            // Reset diagnostic counters
-            context->frames_expected = 0;
-            context->frames_captured = 0;
-            context->frames_delivered_to_obs = 0;
-            context->frames_completed = 0;
-            context->buffer_swaps = 0;
-            context->total_pipeline_latency = 0;
-            last_video_log = now;
-        }
+        // Batch process statistics every N packets or time interval (moved out of hot path)
+        uint64_t now = os_gettime_ns();
+        c64u_process_video_statistics_batch(context, now);
 
         // Validate packet data
         if (lines_per_packet != C64U_LINES_PER_PACKET || pixels_per_line != C64U_PIXELS_PER_LINE ||
@@ -466,8 +511,9 @@ void *video_thread_func(void *data)
                 context->last_capture_time = capture_time;
                 // Complete previous frame if it exists and is reasonably complete
                 if (context->current_frame.received_packets > 0) {
-                    if (is_frame_complete(&context->current_frame) || is_frame_timeout(&context->current_frame)) {
-                        if (is_frame_complete(&context->current_frame)) {
+                    if (c64u_is_frame_complete(&context->current_frame) ||
+                        c64u_is_frame_timeout(&context->current_frame)) {
+                        if (c64u_is_frame_complete(&context->current_frame)) {
                             // Handle frame completion with delay queue for timeout case
                             if (context->last_completed_frame != context->current_frame.frame_num) {
                                 C64U_LOG_DEBUG(
@@ -480,8 +526,8 @@ void *video_thread_func(void *data)
                                 // If no delay configured, process frame immediately
                                 if (context->render_delay_frames == 0) {
                                     if (pthread_mutex_lock(&context->frame_mutex) == 0) {
-                                        assemble_frame_to_buffer(context, &context->current_frame);
-                                        swap_frame_buffers(context);
+                                        c64u_assemble_frame_to_buffer(context, &context->current_frame);
+                                        c64u_swap_frame_buffers(context);
                                         context->last_completed_frame = context->current_frame.frame_num;
                                         // Track diagnostics consistently
                                         context->frames_completed++;
@@ -497,7 +543,7 @@ void *video_thread_func(void *data)
                                     }
                                 } else {
                                     // Add frame to delay queue
-                                    if (enqueue_delayed_frame(context, &context->current_frame, seq_num)) {
+                                    if (c64u_enqueue_delayed_frame(context, &context->current_frame, seq_num)) {
                                         context->last_completed_frame = context->current_frame.frame_num;
                                         context->frames_completed++;
 
@@ -506,10 +552,10 @@ void *video_thread_func(void *data)
                                                        context->render_delay_frames);
 
                                         // Try to dequeue a delayed frame if queue has enough frames
-                                        if (dequeue_delayed_frame(context)) {
+                                        if (c64u_dequeue_delayed_frame(context)) {
                                             // Successfully dequeued a frame, make it available to OBS
                                             if (pthread_mutex_lock(&context->frame_mutex) == 0) {
-                                                swap_frame_buffers(context);
+                                                c64u_swap_frame_buffers(context);
                                                 context->buffer_swaps++;
                                                 context->frames_delivered_to_obs++;
                                                 context->total_pipeline_latency += (os_gettime_ns() - capture_time);
@@ -544,7 +590,7 @@ void *video_thread_func(void *data)
                 }
 
                 // Start new frame
-                init_frame_assembly(&context->current_frame, frame_num);
+                c64u_init_frame_assembly(&context->current_frame, frame_num);
             }
 
             // Add packet to current frame (calculate packet index from line number)
@@ -604,36 +650,36 @@ void *video_thread_func(void *data)
             }
 
             // Check if frame is complete
-            if (is_frame_complete(&context->current_frame)) {
+            if (c64u_is_frame_complete(&context->current_frame)) {
                 // Handle frame completion with delay queue
                 if (context->last_completed_frame != context->current_frame.frame_num) {
 
                     // If no delay configured, process frame immediately
                     if (context->render_delay_frames == 0) {
                         if (pthread_mutex_lock(&context->frame_mutex) == 0) {
-                            assemble_frame_to_buffer(context, &context->current_frame);
-                            swap_frame_buffers(context);
+                            c64u_assemble_frame_to_buffer(context, &context->current_frame);
+                            c64u_swap_frame_buffers(context);
                             context->last_completed_frame = context->current_frame.frame_num;
                             // Track diagnostics (only once per completed frame!)
                             context->frames_completed++;
                             context->buffer_swaps++;
                             context->frames_delivered_to_obs++;
                             context->total_pipeline_latency += (os_gettime_ns() - capture_time);
-                            video_frames++; // Count completed frames for statistics (primary location)
+                            context->video_frames_processed++;
                             pthread_mutex_unlock(&context->frame_mutex);
                         }
                     } else {
                         // Add frame to delay queue
-                        if (enqueue_delayed_frame(context, &context->current_frame, seq_num)) {
+                        if (c64u_enqueue_delayed_frame(context, &context->current_frame, seq_num)) {
                             context->last_completed_frame = context->current_frame.frame_num;
                             context->frames_completed++;
-                            video_frames++;
+                            context->video_frames_processed++;
 
                             // Try to dequeue a delayed frame if queue has enough frames
-                            if (dequeue_delayed_frame(context)) {
+                            if (c64u_dequeue_delayed_frame(context)) {
                                 // Successfully dequeued a frame, make it available to OBS
                                 if (pthread_mutex_lock(&context->frame_mutex) == 0) {
-                                    swap_frame_buffers(context);
+                                    c64u_swap_frame_buffers(context);
                                     context->buffer_swaps++;
                                     context->frames_delivered_to_obs++;
                                     context->total_pipeline_latency += (os_gettime_ns() - capture_time);
@@ -645,7 +691,7 @@ void *video_thread_func(void *data)
                 }
 
                 // Reset for next frame
-                init_frame_assembly(&context->current_frame, 0);
+                c64u_init_frame_assembly(&context->current_frame, 0);
             }
         }
 
